@@ -1,0 +1,5 @@
+name = "advanced-proxy-worker"
+main = "worker.js"
+compatibility_date = "2026-10-08"
+
+# This tells Cloudflare that this is a Worker, not a static website!
