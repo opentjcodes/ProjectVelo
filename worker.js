@@ -7,6 +7,7 @@ export default {
 async function handleRequest(request) {
   const reqUrl = new URL(request.url);
   const query = reqUrl.searchParams.get('url');
+  const proxyBase = reqUrl.origin + reqUrl.pathname + '?url=';
 
   // 1. Handle CORS Preflight
   if (request.method === 'OPTIONS') {
@@ -20,32 +21,54 @@ async function handleRequest(request) {
     });
   }
 
+  // 2. THE REFERER FALLBACK (Fixes Brave Images & Escaped URLs)
+  // If a site uses JS to navigate to "/images" without our ?url= parameter,
+  // we catch it here, look at where it came from, and force it back into the proxy.
   if (!query) {
-    return new Response('Ultimate Proxy Active. Pass a query or URL via ?url=', { 
+    const referer = request.headers.get('Referer');
+    if (referer && referer.includes('?url=')) {
+      try {
+        const refUrl = new URL(referer);
+        const refTarget = new URL(refUrl.searchParams.get('url'));
+        const reconstructedUrl = refTarget.origin + reqUrl.pathname + reqUrl.search;
+        return Response.redirect(proxyBase + encodeURIComponent(reconstructedUrl), 302);
+      } catch (e) {}
+    }
+    return new Response('Advanced Anonymous Proxy Active. Pass a query or URL via ?url=', { 
       status: 200,
       headers: { 'Access-Control-Allow-Origin': '*' }
     });
   }
 
-  // 2. Smart Query Parsing
+  // 3. Smart Query Parsing (Brave Default)
   let targetUrl;
   if (isUrl(query)) {
     targetUrl = query.startsWith('http') ? query : 'https://' + query;
   } else {
-    targetUrl = 'https://www.google.com/search?q=' + encodeURIComponent(query); // Switched default to Google!
+    targetUrl = 'https://search.brave.com/search?q=' + encodeURIComponent(query);
   }
-
   const parsedTargetUrl = new URL(targetUrl);
 
-  // 3. Prepare Proxy Request
+  // 4. TOTAL ANONYMIZATION & HEADER SPOOFING
   const proxyHeaders = new Headers(request.headers);
+  
+  // Strip identifying headers
   proxyHeaders.delete('Host');
   proxyHeaders.delete('Referer');
   proxyHeaders.delete('Origin');
-  
-  // Spoof a perfect modern browser to bypass Google/Cloudflare bot protections
-  proxyHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  proxyHeaders.delete('CF-Connecting-IP');
+  proxyHeaders.delete('X-Forwarded-For');
+  proxyHeaders.delete('X-Real-IP');
+  proxyHeaders.delete('True-Client-IP');
+  proxyHeaders.delete('CF-Ray');
+  proxyHeaders.delete('CF-Visitor');
+
+  // Spoof a standard desktop browser to bypass bot protection
+  proxyHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
   proxyHeaders.set('Accept-Language', 'en-US,en;q=0.9');
+  proxyHeaders.set('Sec-Fetch-Dest', 'document');
+  proxyHeaders.set('Sec-Fetch-Mode', 'navigate');
+  proxyHeaders.set('Sec-Fetch-Site', 'none');
 
   const proxyRequest = new Request(parsedTargetUrl, {
     method: request.method,
@@ -56,9 +79,8 @@ async function handleRequest(request) {
 
   try {
     const response = await fetch(proxyRequest);
-    const proxyBase = reqUrl.origin + reqUrl.pathname + '?url=';
 
-    // 4. Handle Redirects
+    // 5. Handle Redirects
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('Location');
       if (location) {
@@ -67,20 +89,30 @@ async function handleRequest(request) {
       }
     }
 
-    // 5. Prepare Response Headers & Rewrite Cookies (Crucial for Google)
+    // 6. Prepare Response Headers (Bypass Security & Rewrite Cookies)
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set('Access-Control-Allow-Origin', '*');
+    
+    // Strip headers that block iframes (Fixes Google)
     responseHeaders.delete('X-Frame-Options');
     responseHeaders.delete('Content-Security-Policy');
+    responseHeaders.delete('Content-Security-Policy-Report-Only');
     responseHeaders.delete('Clear-Site-Data');
     responseHeaders.delete('Strict-Transport-Security');
+    responseHeaders.delete('Cross-Origin-Opener-Policy');
+    responseHeaders.delete('Cross-Origin-Embedder-Policy');
 
-    // Fix Cookies: Strip domains so they save to your proxy, allowing logins/sessions
-    const cookies = responseHeaders.getSetCookie();
-    responseHeaders.delete('Set-Cookie');
-    for (const cookie of cookies) {
-      const fixedCookie = cookie.replace(/Domain=[^;]+;?/i, '').replace(/SameSite=[^;]+;?/i, 'SameSite=None; Secure;');
-      responseHeaders.append('Set-Cookie', fixedCookie);
+    // Rewrite Cookies so logins work inside the proxy
+    if (responseHeaders.has('set-cookie')) {
+      const cookies = responseHeaders.getSetCookie();
+      responseHeaders.delete('set-cookie');
+      for (const cookie of cookies) {
+        // Remove Domain and Path restrictions so the browser accepts it for the worker domain
+        let rewrittenCookie = cookie.replace(/Domain=[^;]+;?/i, '').replace(/Path=[^;]+;?/i, 'Path=/;');
+        // Remove SameSite=Strict which breaks iframe cookies
+        rewrittenCookie = rewrittenCookie.replace(/SameSite=Strict;?/i, 'SameSite=None; Secure;');
+        responseHeaders.append('set-cookie', rewrittenCookie);
+      }
     }
 
     let finalResponse = new Response(response.body, {
@@ -89,7 +121,7 @@ async function handleRequest(request) {
       headers: responseHeaders
     });
 
-    // 6. Advanced HTML Rewriting + Aggressive JS Injection
+    // 7. Inject the "God Script" into HTML
     const contentType = responseHeaders.get('content-type') || '';
     if (contentType.includes('text/html')) {
       finalResponse = rewriteHTML(finalResponse, parsedTargetUrl.href, proxyBase);
@@ -119,9 +151,7 @@ function isUrl(str) {
 
 function rewriteHTML(response, targetUrl, proxyBase) {
   class AttributeRewriter {
-    constructor(attributeName) {
-      this.attributeName = attributeName;
-    }
+    constructor(attributeName) { this.attributeName = attributeName; }
     element(element) {
       const attribute = element.getAttribute(this.attributeName);
       if (attribute && !attribute.startsWith('data:') && !attribute.startsWith('javascript:') && !attribute.startsWith('#')) {
@@ -135,93 +165,89 @@ function rewriteHTML(response, targetUrl, proxyBase) {
 
   class HeadRewriter {
     element(element) {
-      // Injecting the Ultimate Client-Side Interceptor
-      element.append(`
+      // THE GOD SCRIPT: Kills framebusting, intercepts History API, Forms, and Clicks
+      const script = `
         <script>
           (function() {
             const proxyBase = "${proxyBase}";
-            const currentUrl = "${targetUrl}";
+            const targetUrl = "${targetUrl}";
 
-            // 1. Intercept History API (Fixes Brave Images & SPAs)
-            const origPushState = history.pushState;
+            // 1. KILL FRAMEBUSTING (Fixes Google)
+            try {
+              Object.defineProperty(window, 'top', { value: window, writable: false, configurable: false });
+              Object.defineProperty(window, 'parent', { value: window, writable: false, configurable: false });
+            } catch(e) {}
+
+            // 2. INTERCEPT HISTORY API (Fixes Brave Images Tab)
+            const origPush = history.pushState;
             history.pushState = function(state, unused, url) {
               if (url) {
-                const absUrl = new URL(url, currentUrl).href;
-                url = proxyBase + encodeURIComponent(absUrl);
+                try {
+                  let absUrl = new URL(url, targetUrl).href;
+                  if (!absUrl.includes(proxyBase)) url = proxyBase + encodeURIComponent(absUrl);
+                } catch(e) {}
               }
-              return origPushState.apply(this, [state, unused, url]);
+              return origPush.apply(this, [state, unused, url]);
             };
-            
-            const origReplaceState = history.replaceState;
+            const origReplace = history.replaceState;
             history.replaceState = function(state, unused, url) {
               if (url) {
-                const absUrl = new URL(url, currentUrl).href;
-                url = proxyBase + encodeURIComponent(absUrl);
+                try {
+                  let absUrl = new URL(url, targetUrl).href;
+                  if (!absUrl.includes(proxyBase)) url = proxyBase + encodeURIComponent(absUrl);
+                } catch(e) {}
               }
-              return origReplaceState.apply(this, [state, unused, url]);
+              return origReplace.apply(this, [state, unused, url]);
             };
 
-            // 2. Intercept all clicks (Resolves relative URLs correctly)
-            document.addEventListener('click', function(e) {
-              const a = e.target.closest('a');
-              if (a && a.hasAttribute('href')) {
-                const href = a.getAttribute('href');
-                if (!href.startsWith('javascript:') && !href.startsWith('data:') && !href.startsWith('#')) {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  const absUrl = new URL(href, currentUrl).href;
-                  window.location.href = proxyBase + encodeURIComponent(absUrl);
-                }
-              }
-            }, true);
-
-            // 3. Intercept Form Submissions (Fixes Google Search Bar)
+            // 3. INTERCEPT FORMS (Fixes Search Bars inside sites)
             document.addEventListener('submit', function(e) {
               const form = e.target;
-              e.preventDefault();
-              e.stopPropagation();
-              
-              const action = form.getAttribute('action') || currentUrl;
-              const absUrl = new URL(action, currentUrl);
-              
-              if (form.method.toLowerCase() === 'get') {
+              if (form.action && !form.action.includes(proxyBase)) {
+                e.preventDefault();
                 const formData = new FormData(form);
-                for (const [key, value] of formData.entries()) {
-                  absUrl.searchParams.append(key, value);
+                const params = new URLSearchParams();
+                for (const pair of formData.entries()) params.append(pair[0], pair[1]);
+                
+                if (form.method.toLowerCase() === 'get') {
+                  const urlObj = new URL(form.action, targetUrl);
+                  urlObj.search = params.toString();
+                  window.location.href = proxyBase + encodeURIComponent(urlObj.href);
+                } else {
+                  form.action = proxyBase + encodeURIComponent(new URL(form.action, targetUrl).href);
+                  form.submit();
                 }
-                window.location.href = proxyBase + encodeURIComponent(absUrl.href);
-              } else {
-                form.action = proxyBase + encodeURIComponent(absUrl.href);
-                form.submit();
               }
             }, true);
 
-            // 4. Intercept Background Fetches
+            // 4. INTERCEPT CLICKS
+            document.addEventListener('click', function(e) {
+              const a = e.target.closest('a');
+              if (a && a.href && !a.href.startsWith('javascript:') && !a.href.startsWith('data:') && !a.href.startsWith('#')) {
+                if (!a.href.includes(proxyBase)) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  window.location.href = proxyBase + encodeURIComponent(a.href);
+                }
+              }
+            }, true);
+
+            // 5. INTERCEPT FETCH & XHR (Fixes dynamic content loading)
             const originalFetch = window.fetch;
             window.fetch = function() {
               let args = arguments;
-              let url = args[0];
-              if (typeof url === 'string' && url.startsWith('http') && !url.includes(proxyBase)) {
-                args[0] = proxyBase + encodeURIComponent(url);
+              if (typeof args[0] === 'string' && !args[0].startsWith('data:') && !args[0].startsWith('blob:')) {
+                try {
+                  let absUrl = new URL(args[0], targetUrl).href;
+                  if (!absUrl.includes(proxyBase)) args[0] = proxyBase + encodeURIComponent(absUrl);
+                } catch(e) {}
               }
               return originalFetch.apply(this, args);
             };
-
-            const originalOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-              if (typeof url === 'string' && url.startsWith('http') && !url.includes(proxyBase)) {
-                url = proxyBase + encodeURIComponent(url);
-              }
-              return originalOpen.apply(this, [method, url, ...Array.prototype.slice.call(arguments, 2)]);
-            };
-
-            // 5. Disable Service Workers (They break proxies)
-            if (navigator.serviceWorker) {
-              navigator.serviceWorker.register = function() { return Promise.reject('SW disabled by proxy'); };
-            }
           })();
         </script>
-      `, { html: true });
+      `;
+      element.prepend(script, { html: true });
     }
   }
 
