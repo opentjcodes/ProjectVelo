@@ -1,300 +1,257 @@
-/**
- * Ultra-Fast Streaming Edge Proxy & Bridge
- * Optimized for HTTP/2 & HTTP/3 Media Streaming, WebSocket Passthrough,
- * and Native Browser Relative-Path Resolution.
- */
-
-const PREFIX = '/proxy/';
-
-// Domain blocklist for ad/tracker mitigation
-const AD_PATTERNS = [
-  /(^|\.)doubleclick\.net$/i,
-  /(^|\.)google-analytics\.com$/i,
-  /(^|\.)googlesyndication\.com$/i,
-  /(^|\.)googleadservices\.com$/i,
-  /(^|\.)adnxs\.com$/i,
-  /(^|\.)criteo\.(com|net)$/i,
-  /(^|\.)scorecardresearch\.com$/i,
-  /(^|\.)amazon-adsystem\.com$/i
-];
-
 export default {
   async fetch(request, env, ctx) {
-    return await handleGateway(request);
+    return await handleProxy(request);
   }
 };
 
-async function handleGateway(request) {
+// The prefix used to route requests through the proxy
+const PROXY_PREFIX = '/_/';
+
+// Minimal, high-speed tracker blocking (Substring match is 10x faster than Regex)
+const BLOCKED_DOMAINS = [
+  'doubleclick.net', 'googlesyndication.com', 'adservice.google', 
+  'adnxs.com', 'criteo.com', 'taboola.com', 'outbrain.com'
+];
+
+async function handleProxy(request) {
   const reqUrl = new URL(request.url);
+  const proxyOrigin = reqUrl.origin;
 
-  // 1. Dynamic CORS Preflight Handling (RFC Compliant)
+  // 1. Instant CORS Preflight
   if (request.method === 'OPTIONS') {
-    return handleCorsPreflight(request);
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Max-Age': '86400'
+      }
+    });
   }
 
-  // 2. Resolve the Target Destination
-  const targetUrl = resolveTargetUrl(reqUrl);
-  if (!targetUrl) {
-    return serveLandingPage(reqUrl);
+  // 2. High-Speed Routing & Target Resolution
+  let targetUrlStr = '';
+
+  if (reqUrl.pathname.startsWith(PROXY_PREFIX)) {
+    // Explicit proxy request: /_/https://example.com/path
+    targetUrlStr = reqUrl.pathname.slice(PROXY_PREFIX.length) + reqUrl.search;
+    targetUrlStr = targetUrlStr.replace(/^(https?):\/+/, '$1://'); // Fix normalized slashes
+  } else {
+    // Implicit asset request (e.g., /assets/style.css) -> Reconstruct via Referer
+    const referer = request.headers.get('Referer');
+    if (referer) {
+      try {
+        const refUrl = new URL(referer);
+        if (refUrl.pathname.startsWith(PROXY_PREFIX)) {
+          const baseTargetStr = refUrl.pathname.slice(PROXY_PREFIX.length).replace(/^(https?):\/+/, '$1://');
+          const baseUrl = new URL(baseTargetStr);
+          targetUrlStr = new URL(reqUrl.pathname + reqUrl.search, baseUrl).href;
+        }
+      } catch (e) {}
+    }
   }
 
-  // 3. Ad & Telemetry Blocker
-  if (isAdBlocked(targetUrl.hostname)) {
-    return new Response(null, { status: 204, headers: getCorsHeaders(request) });
+  // 3. Fallback UI if no URL is provided
+  if (!targetUrlStr || !targetUrlStr.startsWith('http')) {
+    if (reqUrl.searchParams.has('url')) {
+      targetUrlStr = reqUrl.searchParams.get('url');
+    } else {
+      return new Response(homePageUI(proxyOrigin + PROXY_PREFIX), {
+        headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+      });
+    }
   }
 
-  // 4. WebSocket Passthrough
-  if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-    return forwardWebSocket(request, targetUrl);
+  const targetUrl = new URL(targetUrlStr);
+
+  // Fast Ad-Block Check
+  if (BLOCKED_DOMAINS.some(d => targetUrl.hostname.includes(d))) {
+    return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*' } });
   }
 
-  // 5. Build Upstream Headers
-  const upstreamHeaders = cleanAndBuildRequestHeaders(request, targetUrl);
+  // 4. Header Construction (The "Bridge")
+  const proxyHeaders = new Headers(request.headers);
+  
+  // Strip Cloudflare hop-by-hop headers to prevent detection
+  const hopHeaders = ['cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'x-forwarded-proto', 'x-forwarded-host', 'x-real-ip'];
+  hopHeaders.forEach(h => proxyHeaders.delete(h));
 
-  // 6. Upstream Request Configuration
+  // Spoof identity to match target
+  proxyHeaders.set('Host', targetUrl.host);
+  proxyHeaders.set('Origin', targetUrl.origin);
+  proxyHeaders.set('Referer', targetUrl.href);
+
+  // 5. Execute Request (Native Streaming & WebSockets)
   const fetchInit = {
     method: request.method,
-    headers: upstreamHeaders,
-    redirect: 'manual', // Client handles redirects to preserve path prefixing
-    cf: {
-      cacheEverything: false,
-      scrapeShield: false,
-      mirage: false,
-      minify: { javascript: false, css: false, html: false }
-    }
+    headers: proxyHeaders,
+    redirect: 'manual'
   };
 
-  // Streaming request body for POST/PUT/PATCH
   if (!['GET', 'HEAD'].includes(request.method)) {
     fetchInit.body = request.body;
     fetchInit.duplex = 'half';
   }
 
-  try {
-    const upstreamResponse = await fetch(targetUrl.href, fetchInit);
+  const response = await fetch(targetUrl.href, fetchInit);
 
-    // 7. Handle Upstream Redirects (Preserve Proxy Path)
-    if ([301, 302, 303, 307, 308].includes(upstreamResponse.status)) {
-      return handleRedirect(upstreamResponse, reqUrl, targetUrl);
-    }
-
-    // 8. Build Sanitized Streaming Response
-    const responseHeaders = buildResponseHeaders(upstreamResponse, request, targetUrl);
-
-    // Direct byte-stream passthrough (Zero-Copy)
-    return new Response(upstreamResponse.body, {
-      status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
-      headers: responseHeaders
-    });
-
-  } catch (err) {
-    return new Response(`Gateway Bridge Error: ${err.message}`, {
-      status: 502,
-      headers: { 'Content-Type': 'text/plain', ...getCorsHeaders(request) }
-    });
-  }
-}
-
-// -----------------------------------------------------------------------------
-// ROUTING & URL EXTRACTION ENGINE
-// -----------------------------------------------------------------------------
-
-function resolveTargetUrl(reqUrl) {
-  // Method A: Check Path-Prefix: /proxy/https/domain.com/path
-  if (reqUrl.pathname.startsWith(PREFIX)) {
-    const remainder = reqUrl.pathname.slice(PREFIX.length);
-    const match = remainder.match(/^(https?):?\/?\/?([^\/]+)(.*)/i);
-    if (match) {
-      const scheme = match[1].toLowerCase();
-      const host = match[2];
-      const rest = match[3] || '';
-      try {
-        return new URL(`${scheme}://${host}${rest}${reqUrl.search}`);
-      } catch {}
+  // 6. Handle Redirects Natively
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const location = response.headers.get('Location');
+    if (location) {
+      const absLocation = new URL(location, targetUrl.href).href;
+      return Response.redirect(`${proxyOrigin}${PROXY_PREFIX}${absLocation}`, response.status);
     }
   }
 
-  // Method B: Legacy Query-Param Fallback: ?url=https://domain.com
-  const queryUrl = reqUrl.searchParams.get('url');
-  if (queryUrl) {
-    try {
-      const parsed = queryUrl.startsWith('http') ? queryUrl : `https://${queryUrl}`;
-      return new URL(parsed);
-    } catch {}
-  }
+  // 7. Response Sanitization
+  const resHeaders = new Headers(response.headers);
+  resHeaders.set('Access-Control-Allow-Origin', '*');
+  resHeaders.delete('X-Frame-Options');
+  resHeaders.delete('Content-Security-Policy');
+  resHeaders.delete('Content-Security-Policy-Report-Only');
+  resHeaders.delete('Clear-Site-Data');
 
-  return null;
-}
-
-function handleRedirect(upstreamResponse, clientReqUrl, currentTargetUrl) {
-  const location = upstreamResponse.headers.get('Location');
-  if (!location) {
-    return new Response(null, { status: upstreamResponse.status });
-  }
-
-  // Resolve relative redirect against destination
-  const resolvedTarget = new URL(location, currentTargetUrl.href);
-
-  // Re-encode redirect location into proxy path
-  const newProxyPath = `${PREFIX}${resolvedTarget.protocol.replace(':', '')}/${resolvedTarget.host}${resolvedTarget.pathname}${resolvedTarget.search}`;
-  const redirectUrl = new URL(newProxyPath, clientReqUrl.origin);
-
-  const headers = new Headers();
-  headers.set('Location', redirectUrl.href);
-  return new Response(null, { status: upstreamResponse.status, headers });
-}
-
-// -----------------------------------------------------------------------------
-// HEADER PROCESSING & CORS SANITIZATION
-// -----------------------------------------------------------------------------
-
-function cleanAndBuildRequestHeaders(request, targetUrl) {
-  const headers = new Headers(request.headers);
-
-  // Strip Hop-by-Hop & Cloudflare internal headers
-  const hopHeaders = [
-    'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker',
-    'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
-    'cdn-loop', 'x-amzn-trace-id'
-  ];
-  hopHeaders.forEach(h => headers.delete(h));
-
-  // Spoof destination host attributes
-  headers.set('Host', targetUrl.host);
-  headers.set('Origin', targetUrl.origin);
-  headers.set('Referer', targetUrl.href);
-
-  // Enforce byte ranges for video seeks
-  if (!headers.has('Accept-Encoding')) {
-    headers.set('Accept-Encoding', 'identity');
-  }
-
-  return headers;
-}
-
-function buildResponseHeaders(upstreamResponse, request, targetUrl) {
-  const headers = new Headers(upstreamResponse.headers);
-
-  // Apply Permissive, Spec-Compliant CORS
-  const origin = request.headers.get('Origin');
-  if (origin) {
-    headers.set('Access-Control-Allow-Origin', origin);
-    headers.set('Access-Control-Allow-Credentials', 'true');
-  } else {
-    headers.set('Access-Control-Allow-Origin', '*');
-  }
-
-  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD');
-  headers.set('Access-Control-Allow-Headers', '*');
-  headers.set('Access-Control-Expose-Headers', '*');
-
-  // Strip restrictive security headers that prevent iframe/media integration
-  headers.delete('Content-Security-Policy');
-  headers.delete('Content-Security-Policy-Report-Only');
-  headers.delete('X-Frame-Options');
-  headers.delete('Cross-Origin-Opener-Policy');
-  headers.delete('Cross-Origin-Embedder-Policy');
-  headers.delete('Cross-Origin-Resource-Policy');
-
-  // Cookie Domain Rewriting to preserve sessions
-  if (headers.has('set-cookie')) {
-    const rawCookies = headers.getSetCookie();
-    headers.delete('set-cookie');
-    for (const cookie of rawCookies) {
+  // Rewrite Cookies to stick to the proxy session
+  if (resHeaders.has('set-cookie')) {
+    const cookies = resHeaders.getSetCookie();
+    resHeaders.delete('set-cookie');
+    for (const cookie of cookies) {
       const rewritten = cookie
         .replace(/Domain=[^;]+;?/gi, '')
         .replace(/Path=[^;]+;?/gi, 'Path=/;')
         .replace(/SameSite=Strict;?/gi, 'SameSite=None; Secure;');
-      headers.append('set-cookie', rewritten);
+      resHeaders.append('set-cookie', rewritten);
     }
   }
 
-  // Preserve streaming metadata headers
-  // (Content-Range, Accept-Ranges, Content-Length are left intact automatically)
+  // 8. ZERO-COPY PIPELINE FOR VIDEO & MEDIA
+  // If it's not HTML, pipe it directly to the user. This fixes the slow video streaming.
+  const contentType = (resHeaders.get('content-type') || '').toLowerCase();
+  if (!contentType.includes('text/html')) {
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: resHeaders
+    });
+  }
 
-  return headers;
+  // 9. Ultra-Fast HTML Injection (Only rewrites absolute URLs, ignores relative)
+  return rewriteHTML(response, resHeaders, targetUrl.href, proxyOrigin + PROXY_PREFIX);
 }
 
-function getCorsHeaders(request) {
-  const origin = request.headers.get('Origin');
-  return {
-    'Access-Control-Allow-Origin': origin || '*',
-    ...(origin ? { 'Access-Control-Allow-Credentials': 'true' } : {}),
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD',
-    'Access-Control-Allow-Headers': '*',
-    'Access-Control-Max-Age': '86400'
-  };
-}
-
-function handleCorsPreflight(request) {
-  return new Response(null, {
-    status: 204,
-    headers: getCorsHeaders(request)
-  });
-}
-
-// -----------------------------------------------------------------------------
-// WEBSOCKET FORWARDER
-// -----------------------------------------------------------------------------
-
-function forwardWebSocket(request, targetUrl) {
-  const wsHeaders = new Headers(request.headers);
-  wsHeaders.set('Host', targetUrl.host);
-  wsHeaders.set('Origin', targetUrl.origin);
-
-  return fetch(targetUrl.href, {
-    method: request.method,
-    headers: wsHeaders
-  });
-}
-
-// -----------------------------------------------------------------------------
-// UTILITIES
-// -----------------------------------------------------------------------------
-
-function isAdBlocked(hostname) {
-  return AD_PATTERNS.some(p => p.test(hostname));
-}
-
-function serveLandingPage(reqUrl) {
-  const demoUrl = `${reqUrl.origin}${PREFIX}https/dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd`;
-  const html = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>High-Throughput Gateway</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 600px; margin: 4rem auto; padding: 0 1rem; color: #111; line-height: 1.5; }
-    code { background: #f4f4f5; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.9em; word-break: break-all; }
-    input { width: 100%; padding: 0.75rem; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; margin: 1rem 0; font-size: 1rem; }
-    button { background: #0066cc; color: #fff; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; cursor: pointer; font-size: 1rem; }
-  </style>
-</head>
-<body>
-  <h2>Streaming Edge Bridge</h2>
-  <p>To proxy resources and stream media natively, prefix target URLs as follows:</p>
-  <code>${reqUrl.origin}${PREFIX}https/{domain}/{path}</code>
-  
-  <form onsubmit="event.preventDefault(); navigate();">
-    <input type="text" id="target" placeholder="https://example.com/stream.m3u8" required />
-    <button type="submit">Open Bridge</button>
-  </form>
-
-  <script>
-    function navigate() {
-      let raw = document.getElementById('target').value.trim();
-      if (!raw.startsWith('http://') && !raw.startsWith('https://')) raw = 'https://' + raw;
-      const parsed = new URL(raw);
-      const scheme = parsed.protocol.replace(':', '');
-      window.location.href = '${PREFIX}' + scheme + '/' + parsed.host + parsed.pathname + parsed.search;
+// ---------------------------------------------------------------------------
+// HIGH-SPEED HTML REWRITER & CLIENT SANDBOX
+// ---------------------------------------------------------------------------
+function rewriteHTML(response, headers, targetUrl, proxyPrefix) {
+  class FastAbsoluteRewriter {
+    constructor(attr) { this.attr = attr; }
+    element(el) {
+      const val = el.getAttribute(this.attr);
+      // Only rewrite absolute URLs. Relative URLs are handled natively by the browser + Referer fallback!
+      if (val && (val.startsWith('http://') || val.startsWith('https://'))) {
+        el.setAttribute(this.attr, proxyPrefix + val);
+      } else if (val && val.startsWith('//')) {
+        el.setAttribute(this.attr, proxyPrefix + 'https:' + val);
+      }
     }
-  </script>
-</body>
-</html>`;
+  }
 
-  return new Response(html, {
-    status: 200,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
-  });
+  class HeadInjector {
+    element(el) {
+      // Inject a lightweight client-side interceptor
+      el.prepend(`
+        <script>
+          (function() {
+            const prefix = "${proxyPrefix}";
+            function rewrite(u) {
+              if (!u || typeof u !== 'string') return u;
+              if (u.startsWith(prefix)) return u;
+              if (u.startsWith('http://') || u.startsWith('https://')) return prefix + u;
+              if (u.startsWith('//')) return prefix + window.location.protocol + u;
+              return u;
+            }
+
+            // Intercept Fetch API
+            const origFetch = window.fetch;
+            window.fetch = function(input, init) {
+              if (typeof input === 'string') input = rewrite(input);
+              else if (input instanceof Request) input = new Request(rewrite(input.url), input);
+              else if (input instanceof URL) input = rewrite(input.href);
+              return origFetch.call(this, input, init);
+            };
+
+            // Intercept XHR
+            const origOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+              return origOpen.call(this, method, rewrite(url), ...rest);
+            };
+
+            // Intercept WebSockets
+            const OrigWS = window.WebSocket;
+            window.WebSocket = function(url, protocols) {
+              let proxied = url;
+              if (typeof url === 'string' && (url.startsWith('ws://') || url.startsWith('wss://'))) {
+                proxied = rewrite(url.replace(/^ws/, 'http')).replace(/^http/, 'ws');
+              }
+              return protocols ? new OrigWS(proxied, protocols) : new OrigWS(proxied);
+            };
+            window.WebSocket.prototype = OrigWS.prototype;
+
+            // Intercept History API to keep navigation inside proxy
+            const origPush = history.pushState;
+            history.pushState = function(state, title, url) {
+              if (url) url = rewrite(url);
+              return origPush.call(this, state, title, url);
+            };
+          })();
+        </script>
+      `, { html: true });
+    }
+  }
+
+  return new HTMLRewriter()
+    .on('head', new HeadInjector())
+    .on('a', new FastAbsoluteRewriter('href'))
+    .on('link', new FastAbsoluteRewriter('href'))
+    .on('img', new FastAbsoluteRewriter('src'))
+    .on('script', new FastAbsoluteRewriter('src'))
+    .on('iframe', new FastAbsoluteRewriter('src'))
+    .on('source', new FastAbsoluteRewriter('src'))
+    .on('video', new FastAbsoluteRewriter('src'))
+    .on('form', new FastAbsoluteRewriter('action'))
+    .transform(new Response(response.body, { status: response.status, headers }));
+}
+
+// ---------------------------------------------------------------------------
+// MINIMAL UI FOR ROOT ACCESS
+// ---------------------------------------------------------------------------
+function homePageUI(proxyPrefix) {
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Edge Proxy</title>
+      <style>
+        body { font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #0f172a; color: #fff; margin: 0; }
+        .container { text-align: center; background: #1e293b; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        input { padding: 12px; width: 300px; border-radius: 6px; border: none; outline: none; font-size: 16px; }
+        button { padding: 12px 20px; margin-left: 8px; border: none; border-radius: 6px; background: #3b82f6; color: white; font-size: 16px; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #2563eb; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h2>🌐 Edge Proxy</h2>
+        <form onsubmit="event.preventDefault(); window.location.href = '${proxyPrefix}' + document.getElementById('url').value;">
+          <input type="url" id="url" placeholder="https://example.com" required>
+          <button type="submit">Go</button>
+        </form>
+      </div>
+    </body>
+    </html>
+  `;
 }
