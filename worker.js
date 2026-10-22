@@ -1,27 +1,12 @@
-/**
- * ProjectVelo v4.0 — Ultra-Retention Zero-Buffer Streaming Cloudflare Worker
- * Deployed at: https://projectvelo.tjcodewizard.workers.dev/
- *
- * Key Upgrades in v4.0:
- * 1. Native C++ ReadableStream Pass-Through (Zero TransformStream CPU overhead)
- * 2. 15-Language Regional Cookie + Indian Geo-Header Forwarding
- * 3. Stripped Content-Encoding on proxied streams (Fixes ERR_CONTENT_DECODING_FAILED)
- * 4. Canonical Sorted Edge Cache Keys (Maximizes Cloudflare Edge Cache HIT ratio)
- * 5. 6-Stage Audio CDN Auto-Healer (aac_320 -> aac_160 -> aac_96 -> h_96 -> preview + Edge URL Memoization)
- * 6. One-Hop /play Endpoint with Multi-Provider Audio Fallback (Saavn -> Audius -> Deezer)
- * 7. Real-Time Synced Lyrics Engine (/lyrics) with Title Sanitization + Line & Word-Level Timestamps
- */
-
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Range, If-Range, X-Custom-Headers, X-Custom-UA, X-Custom-Referer",
-  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Upstream-Status, X-Upstream-Url, X-Cache-Status, X-Resolved-Bitrate"
+  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Upstream-Status, X-Upstream-Url, X-Cache-Status, X-Resolved-Bitrate, X-Lyrics-Source"
 };
 
 const SAAVN_API_BASE = "https://www.jiosaavn.com/api.php";
 
-// Expanded to all major Indian regional languages + Indian Geo-IP headers to prevent catalog/stream geo-blocking
 const SAAVN_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
   "Accept": "application/json, text/plain, */*",
@@ -33,12 +18,8 @@ const SAAVN_HEADERS = {
   "Cookie": "L=english%2Chindi%2Cmalayalam%2Ctamil%2Ctelugu%2Cpunjabi%2Cbengali%2Cmarathi%2Ckannada%2Cgujarati%2Curdu%2Codia%2Cassamese%2Cbhojpuri%2Charyanvi; gdpr_acceptance=true; DL=english"
 };
 
-// In-memory isolate cache for resolved working CDN URLs (avoids re-probing on every Range scrub request)
 const WORKING_STREAM_MEMO = new Map();
 
-// ============================================================================
-// 1. PURE-JS DES-ECB DECRYPTOR (With URL-Safe Base64 Sanitization)
-// ============================================================================
 const DES_IP = [
   58,50,42,34,26,18,10,2, 60,52,44,36,28,20,12,4,
   62,54,46,38,30,22,14,6, 64,56,48,40,32,24,16,8,
@@ -108,7 +89,6 @@ const SA_SUBKEYS = (() => {
 function decryptSaavnMediaUrl(encryptedBase64, has320 = true) {
   if (!encryptedBase64 || typeof encryptedBase64 !== "string") return null;
   try {
-    // Sanitize URL-safe Base64, spaces, and missing padding
     let b64 = encryptedBase64
       .trim()
       .replace(/ /g, "+")
@@ -160,7 +140,6 @@ function decryptSaavnMediaUrl(encryptedBase64, has320 = true) {
     let url = String.fromCharCode(...outBytes.slice(0, validLen)).trim();
     if (!url.startsWith("http")) return null;
 
-    // Normalize legacy h.saavncdn.com or http:// links to https://aac.saavncdn.com
     url = url
       .replace(/^http:\/\//i, "https://")
       .replace("://h.saavncdn.com/", "://aac.saavncdn.com/");
@@ -173,10 +152,6 @@ function decryptSaavnMediaUrl(encryptedBase64, has320 = true) {
   }
 }
 
-/**
- * Generates an ordered 5-stage CDN fallback list for any JioSaavn audio URL.
- * Fixes songs where _320.mp4 or _160.mp4 is missing on aac.saavncdn.com!
- */
 function buildSaavnBitrateCascade(rawAudioUrl) {
   if (!rawAudioUrl || !rawAudioUrl.includes("saavncdn.com")) {
     return [rawAudioUrl].filter(Boolean);
@@ -202,9 +177,6 @@ function buildSaavnBitrateCascade(rawAudioUrl) {
   return [...new Set(candidates.filter(Boolean))];
 }
 
-// ============================================================================
-// 2. HELPERS: ENTITY DECODING, JSON SANITIZER & SONG/ALBUM NORMALIZERS
-// ============================================================================
 function cleanText(str) {
   if (!str) return "";
   return String(str)
@@ -277,14 +249,30 @@ function enrichSaavnSong(s, origin) {
     }
   }
 
-  let primaryArtists = "";
+  const artistNames = [];
   if (more.artistMap?.primary_artists?.length) {
-    primaryArtists = more.artistMap.primary_artists.map(a => cleanText(a.name)).join(", ");
-  } else if (Array.isArray(more.primary_artists)) {
-    primaryArtists = more.primary_artists.map(a => cleanText(a.name || a)).join(", ");
-  } else {
-    primaryArtists = cleanText(more.primary_artists || s.primary_artists || more.music || s.subtitle || "Unknown Artist");
+    for (const a of more.artistMap.primary_artists) {
+      if (a?.name) artistNames.push(cleanText(a.name));
+    }
   }
+  if (more.artistMap?.featured_artists?.length) {
+    for (const a of more.artistMap.featured_artists) {
+      if (a?.name) artistNames.push(cleanText(a.name));
+    }
+  }
+  if (more.artistMap?.artists?.length) {
+    for (const a of more.artistMap.artists) {
+      if (a?.name) artistNames.push(cleanText(a.name));
+    }
+  }
+  if (more.singers) {
+    artistNames.push(...String(more.singers).split(",").map(cleanText));
+  }
+  if (more.primary_artists || s.primary_artists) {
+    artistNames.push(...String(more.primary_artists || s.primary_artists).split(",").map(cleanText));
+  }
+  const uniqueArtists = [...new Set(artistNames.filter(Boolean))];
+  const primaryArtists = uniqueArtists.slice(0, 4).join(", ") || cleanText(more.music || s.subtitle || "Unknown Artist");
 
   const hiResImg = upgradeImage(s.image || s.coverUrl);
   const titleClean = cleanText(s.title || s.song || "Untitled");
@@ -293,7 +281,6 @@ function enrichSaavnSong(s, origin) {
   const durationSec = parseInt(more.duration || s.duration || "0", 10) || 0;
   const hasLyrics = String(more.has_lyrics || s.has_lyrics || "false") === "true";
 
-  // Both direct /stream and smart one-hop /play URLs
   const workerStream = directUrl
     ? `${origin}/stream?url=${encodeURIComponent(directUrl)}`
     : `${origin}/play?id=${encodeURIComponent(String(s.id))}&title=${encodeURIComponent(titleClean)}&artist=${encodeURIComponent(primaryArtists)}`;
@@ -310,6 +297,7 @@ function enrichSaavnSong(s, origin) {
     itemType: "song",
     title: titleClean,
     artist: primaryArtists,
+    allArtists: uniqueArtists,
     subtitle: primaryArtists,
     album: albumTitle,
     albumId: albumId ? String(albumId) : null,
@@ -372,9 +360,6 @@ function enrichSaavnAlbum(a, origin) {
   };
 }
 
-// ============================================================================
-// 3. DEEP ALBUM & PLAYLIST RESOLVER (With Chunked Batch Track Healing)
-// ============================================================================
 async function resolveCompleteAlbum(albumIdOrToken, origin) {
   const cleanId = String(albumIdOrToken || "").trim();
   if (!cleanId) throw new Error("Missing album ID");
@@ -384,7 +369,6 @@ async function resolveCompleteAlbum(albumIdOrToken, origin) {
 
   const isNumeric = /^\d+$/.test(cleanId);
 
-  // Step 1: Alphanumeric token or full URL via webapi.get
   if (!isNumeric) {
     const token = cleanId.split("/").filter(Boolean).pop();
     for (const type of ["album", "playlist"]) {
@@ -404,7 +388,6 @@ async function resolveCompleteAlbum(albumIdOrToken, origin) {
     }
   }
 
-  // Step 2: Numeric v4 content.getAlbumDetails
   if (rawTrackList.length === 0 && isNumeric) {
     try {
       const v4Data = await fetchSaavnJson({
@@ -419,7 +402,6 @@ async function resolveCompleteAlbum(albumIdOrToken, origin) {
     } catch {}
   }
 
-  // Step 3: Numeric v3 content.getAlbumDetails fallback
   if (rawTrackList.length === 0 && isNumeric) {
     try {
       const v3Data = await fetchSaavnJson({
@@ -433,7 +415,6 @@ async function resolveCompleteAlbum(albumIdOrToken, origin) {
     } catch {}
   }
 
-  // Step 4: Numeric playlist.getDetails fallback
   if (rawTrackList.length === 0 && isNumeric) {
     try {
       const plData = await fetchSaavnJson({
@@ -452,7 +433,6 @@ async function resolveCompleteAlbum(albumIdOrToken, origin) {
     albumPayload = { id: cleanId, title: "Album", songs: [], list: [] };
   }
 
-  // Step 5: Heal any tracks missing encrypted_media_url in chunks of 20 PIDs
   const missingPids = rawTrackList
     .filter(t => t && t.id && !(t.more_info?.encrypted_media_url || t.encrypted_media_url))
     .map(t => String(t.id));
@@ -479,7 +459,6 @@ async function resolveCompleteAlbum(albumIdOrToken, origin) {
     .map(s => enrichSaavnSong(s, origin))
     .filter(s => s && s.id);
 
-  // Step 6: Fetch Related Albums for retention
   let relatedAlbums = [];
   if (isNumeric) {
     try {
@@ -505,29 +484,60 @@ async function resolveCompleteAlbum(albumIdOrToken, origin) {
   };
 }
 
-// ============================================================================
-// 4. REAL-TIME SYNCED LYRICS ENGINE (/lyrics)
-// Parses LRC timestamps + Word-Level Timings + Cleans Bollywood/Regional Titles
-// ============================================================================
-function cleanSongTitleForLyrics(rawTitle) {
-  if (!rawTitle) return "";
-  return cleanText(rawTitle)
-    .replace(/\((from|feat|ft|original|motion picture|video|audio|ost|lofi|slowed|reverb)[^)]*\)/gi, "")
-    .replace(/\[(from|feat|ft|original|motion picture|video|audio|ost|lofi|slowed|reverb)[^\]]*\]/gi, "")
-    .replace(/-\s*(from|feat|ft|original|ost).*$/gi, "")
+function extractLyricsSearchTokens(rawTitle, rawArtist, rawAlbum, extraArtists = []) {
+  const fullTitle = cleanText(rawTitle || "");
+  let extractedMovie = "";
+  const fromMatch = fullTitle.match(/(?:from|movie)\s+["'“”‘’]?([^)"'\]”’]+)["'“”‘’]?/i);
+  if (fromMatch && fromMatch[1]) {
+    extractedMovie = fromMatch[1].trim();
+  }
+
+  const baseTitle = fullTitle
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/-\s*(from|feat|ft|original|ost|version|malayalam|tamil|telugu|hindi|kannada|remix|lofi|slowed|reverb|unplugged|live|film|motion picture).*$/gi, " ")
+    .replace(/["'“”‘’]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+
+  const titleParts = baseTitle
+    .split(/\s*[-–—:|/]\s*/)
+    .map(s => s.trim())
+    .filter(s => s.length >= 2);
+
+  const primaryTitle = titleParts[0] || baseTitle || fullTitle;
+  const secondaryTitle = titleParts.length > 1 ? titleParts[titleParts.length - 1] : "";
+
+  const allArtistsRaw = [
+    ...String(rawArtist || "").split(/[,&/|]/),
+    ...extraArtists
+  ]
+    .map(a => cleanText(a).replace(/\([^)]*\)/g, "").trim())
+    .filter(a => a && a.toLowerCase() !== "unknown artist" && a.toLowerCase() !== "various artists");
+
+  const uniqueArtists = [...new Set(allArtistsRaw)];
+
+  const cleanAlbum = cleanText(rawAlbum || extractedMovie || "")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/original motion picture soundtrack/gi, "")
+    .replace(/["'“”‘’]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const validAlbum = (cleanAlbum && cleanAlbum.toLowerCase() !== "openmuse" && cleanAlbum.toLowerCase() !== primaryTitle.toLowerCase())
+    ? cleanAlbum
+    : (extractedMovie || "");
+
+  return {
+    primaryTitle,
+    secondaryTitle,
+    baseTitle,
+    artists: uniqueArtists,
+    album: validAlbum
+  };
 }
 
-function cleanPrimaryArtistForLyrics(rawArtist) {
-  if (!rawArtist) return "";
-  return cleanText(rawArtist).split(",")[0].split("&")[0].trim();
-}
-
-/**
- * Parses standard & enhanced LRC into a structured real-time timeline array:
- * lines: [{ index, time, endTime, duration, text, words: [{ word, time, endTime }] }]
- */
 function parseLrcToTimeline(lrcString, totalDurationSec = 0) {
   if (!lrcString || typeof lrcString !== "string") return [];
 
@@ -562,6 +572,7 @@ function parseLrcToTimeline(lrcString, totalDurationSec = 0) {
 
     const contentRaw = line.replace(timeRegex, "").trim();
     const cleanLineText = contentRaw.replace(wordTimeRegex, "").replace(/\s+/g, " ").trim();
+    if (/^(by|offset|ar|ti|al|length|re|ve)\s*:/i.test(cleanLineText)) continue;
 
     for (const t of timestamps) {
       parsedEntries.push({
@@ -574,7 +585,6 @@ function parseLrcToTimeline(lrcString, totalDurationSec = 0) {
 
   parsedEntries.sort((a, b) => a.time - b.time);
 
-  // Calculate endTime, duration, and per-word real-time highlights for each line
   return parsedEntries.map((entry, idx) => {
     const nextEntry = parsedEntries[idx + 1];
     const fallbackEnd = totalDurationSec > entry.time ? totalDurationSec : entry.time + 4.5;
@@ -606,38 +616,38 @@ function parseLrcToTimeline(lrcString, totalDurationSec = 0) {
   });
 }
 
-/**
- * Generates an estimated line & word timeline when only plain (unsynced) lyrics exist
- * so the frontend real-time lyricscroller still highlights smoothly.
- */
 function buildEstimatedTimelineFromPlain(plainLyrics, totalDurationSec = 180) {
   if (!plainLyrics) return [];
   const rawLines = plainLyrics
+    .replace(/<br\s*\/?>/gi, "\n")
     .split(/\r?\n/)
-    .map(l => l.trim())
-    .filter(Boolean);
+    .map(l => cleanText(l))
+    .filter(l => l && !/^(lyrics|lyricist|music|singer|cast)\s*:/i.test(l));
 
   if (rawLines.length === 0) return [];
 
-  const usableDuration = Math.max(30, (totalDurationSec || 180) - 14);
-  const startTimeOffset = 6.0;
+  const usableDuration = Math.max(35, (totalDurationSec || 185) - 14);
+  const startTimeOffset = 5.0;
   const totalWeight = rawLines.reduce((sum, l) => sum + Math.max(6, l.length), 0);
 
   let currentSec = startTimeOffset;
   return rawLines.map((text, idx) => {
     const weight = Math.max(6, text.length) / totalWeight;
-    const lineDuration = Math.max(1.5, usableDuration * weight);
+    const lineDuration = Math.max(1.4, usableDuration * weight);
     const start = Number(currentSec.toFixed(3));
     const end = Number((currentSec + lineDuration).toFixed(3));
     currentSec += lineDuration;
 
     const rawWords = text.split(/\s+/).filter(Boolean);
-    const wordDur = lineDuration / Math.max(1, rawWords.length);
-    const words = rawWords.map((w, wIdx) => ({
-      word: w,
-      time: Number((start + wIdx * wordDur).toFixed(3)),
-      endTime: Number((start + (wIdx + 1) * wordDur).toFixed(3))
-    }));
+    const totalChars = Math.max(1, rawWords.reduce((acc, w) => acc + w.length, 0));
+    let cursor = start;
+    const words = rawWords.map((w, wIdx) => {
+      const wDur = lineDuration * (w.length / totalChars);
+      const wStart = Number(cursor.toFixed(3));
+      const wEnd = wIdx === rawWords.length - 1 ? end : Number((cursor + wDur).toFixed(3));
+      cursor += wDur;
+      return { word: w, time: wStart, endTime: wEnd };
+    });
 
     return {
       index: idx,
@@ -651,6 +661,259 @@ function buildEstimatedTimelineFromPlain(plainLyrics, totalDurationSec = 180) {
   });
 }
 
+function normalizeTokenComparison(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u0900-\u0d7f]+/g, " ")
+    .trim();
+}
+
+function scoreLrcCandidate(item, tokens, durationSec) {
+  if (!item || (!item.syncedLyrics && !item.plainLyrics)) return -999;
+
+  const itemTitle = normalizeTokenComparison(item.trackName || item.name || "");
+  const itemArtist = normalizeTokenComparison(item.artistName || "");
+  const itemAlbum = normalizeTokenComparison(item.albumName || "");
+  const targetTitle = normalizeTokenComparison(tokens.primaryTitle);
+  const altTitle = normalizeTokenComparison(tokens.secondaryTitle);
+
+  let titleMatched = false;
+  let score = 0;
+
+  if (targetTitle && (itemTitle === targetTitle || itemTitle.includes(targetTitle) || targetTitle.includes(itemTitle))) {
+    titleMatched = true;
+    score += itemTitle === targetTitle ? 90 : 60;
+  } else if (altTitle && altTitle.length >= 3 && (itemTitle === altTitle || itemTitle.includes(altTitle))) {
+    titleMatched = true;
+    score += 55;
+  }
+
+  if (!titleMatched) return -500;
+
+  let artistOrAlbumMatched = false;
+  for (const a of tokens.artists) {
+    const normA = normalizeTokenComparison(a);
+    if (!normA) continue;
+    const firstWord = normA.split(" ").find(w => w.length >= 3) || normA;
+    if (itemArtist.includes(normA) || normA.includes(itemArtist) || (firstWord.length >= 4 && itemArtist.includes(firstWord))) {
+      score += 75;
+      artistOrAlbumMatched = true;
+      break;
+    }
+    if (itemAlbum && (itemAlbum.includes(normA) || (firstWord.length >= 4 && itemAlbum.includes(firstWord)))) {
+      score += 45;
+      artistOrAlbumMatched = true;
+      break;
+    }
+  }
+
+  if (tokens.album) {
+    const normAlb = normalizeTokenComparison(tokens.album);
+    if (normAlb && (itemAlbum.includes(normAlb) || itemTitle.includes(normAlb) || itemArtist.includes(normAlb))) {
+      score += 65;
+      artistOrAlbumMatched = true;
+    }
+  }
+
+  if (durationSec > 0 && item.duration) {
+    const diff = Math.abs(durationSec - Number(item.duration));
+    if (diff <= 2) {
+      score += 80;
+      artistOrAlbumMatched = true;
+    } else if (diff <= 5) {
+      score += 55;
+      artistOrAlbumMatched = true;
+    } else if (diff <= 12) {
+      score += 25;
+    } else if (diff > 35) {
+      score -= 65;
+    }
+  }
+
+  if (!artistOrAlbumMatched && tokens.artists.length > 0 && durationSec > 0) {
+    score -= 40;
+  }
+
+  if (item.syncedLyrics) score += 95;
+  else if (item.plainLyrics) score += 20;
+
+  return score;
+}
+
+async function searchLrclibCandidates(tokens, durationSec) {
+  const headers = { "User-Agent": "OpenMuse-LiquidGlass/5.0 (https://projectvelo.tjcodewizard.workers.dev)" };
+  const urls = [];
+
+  if (tokens.primaryTitle && tokens.artists[0]) {
+    urls.push(`https://lrclib.net/api/search?track_name=${encodeURIComponent(tokens.primaryTitle)}&artist_name=${encodeURIComponent(tokens.artists[0])}`);
+    urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(`${tokens.primaryTitle} ${tokens.artists[0]}`)}`);
+  }
+  if (tokens.primaryTitle && tokens.artists[1]) {
+    urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(`${tokens.primaryTitle} ${tokens.artists[1]}`)}`);
+  }
+  if (tokens.primaryTitle && tokens.album) {
+    urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(`${tokens.primaryTitle} ${tokens.album}`)}`);
+  }
+  if (tokens.primaryTitle) {
+    urls.push(`https://lrclib.net/api/search?track_name=${encodeURIComponent(tokens.primaryTitle)}`);
+  }
+  if (tokens.secondaryTitle && tokens.secondaryTitle.length >= 3) {
+    urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(`${tokens.secondaryTitle} ${tokens.artists[0] || ""}`.trim())}`);
+  }
+
+  const uniqueUrls = [...new Set(urls)].slice(0, 5);
+  const settled = await Promise.allSettled(
+    uniqueUrls.map(u => fetch(u, { headers }).then(r => r.ok ? r.json() : []))
+  );
+
+  const seenIds = new Set();
+  const allCandidates = [];
+
+  for (const res of settled) {
+    if (res.status === "fulfilled" && Array.isArray(res.value)) {
+      for (const item of res.value) {
+        if (item && !seenIds.has(item.id)) {
+          seenIds.add(item.id);
+          allCandidates.push(item);
+        }
+      }
+    }
+  }
+
+  if (allCandidates.length === 0) return null;
+
+  const scored = allCandidates
+    .map(item => ({ item, score: scoreLrcCandidate(item, tokens, durationSec) }))
+    .filter(x => x.score >= 85)
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.item || null;
+}
+
+async function searchNeteaseLyrics(tokens, durationSec) {
+  try {
+    const query = [tokens.primaryTitle, tokens.artists[0] || tokens.album || ""].filter(Boolean).join(" ").trim();
+    if (!query) return null;
+
+    const searchRes = await fetch(`https://music.163.com/api/search/get?s=${encodeURIComponent(query)}&type=1&limit=6`, {
+      headers: {
+        "User-Agent": SAAVN_HEADERS["User-Agent"],
+        "Referer": "https://music.163.com/"
+      }
+    });
+    if (!searchRes.ok) return null;
+    const searchData = await searchRes.json();
+    const songs = searchData?.result?.songs || [];
+    if (!songs.length) return null;
+
+    let bestSong = null;
+    let bestScore = -999;
+
+    for (const s of songs) {
+      const candidateItem = {
+        trackName: s.name,
+        artistName: (s.artists || []).map(a => a.name).join(", "),
+        albumName: s.album?.name || "",
+        duration: s.duration ? Math.round(s.duration / 1000) : 0,
+        syncedLyrics: "1"
+      };
+      const sc = scoreLrcCandidate(candidateItem, tokens, durationSec);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestSong = s;
+      }
+    }
+
+    if (!bestSong || bestScore < 95) return null;
+
+    const lrcRes = await fetch(`https://music.163.com/api/song/lyric?id=${bestSong.id}&lv=1&kv=1&tv=-1`, {
+      headers: {
+        "User-Agent": SAAVN_HEADERS["User-Agent"],
+        "Referer": "https://music.163.com/"
+      }
+    });
+    if (!lrcRes.ok) return null;
+    const lrcJson = await lrcRes.json();
+    const rawLrc = lrcJson?.lrc?.lyric || "";
+    if (!rawLrc || rawLrc.length < 25) return null;
+
+    const lines = parseLrcToTimeline(rawLrc, durationSec);
+    if (lines.length >= 3) {
+      return {
+        source: "NetEaseProvider",
+        isSynced: true,
+        isAutoTimed: false,
+        syncedLyrics: rawLrc,
+        plainLyrics: lines.map(l => l.text).join("\n"),
+        lines
+      };
+    }
+  } catch {}
+  return null;
+}
+
+async function searchKugouLyrics(tokens, durationSec) {
+  try {
+    const keyword = [tokens.primaryTitle, tokens.artists[0] || ""].filter(Boolean).join(" ").trim();
+    if (!keyword) return null;
+
+    const searchUrl = `http://mobilecdn.kugou.com/api/v3/search/song?format=json&keyword=${encodeURIComponent(keyword)}&page=1&pagesize=5`;
+    const sRes = await fetch(searchUrl, { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } });
+    if (!sRes.ok) return null;
+    const sJson = await sRes.json();
+    const infoList = sJson?.data?.info || [];
+    if (!infoList.length) return null;
+
+    let chosen = null;
+    for (const item of infoList) {
+      const cand = {
+        trackName: item.songname,
+        artistName: item.singername,
+        albumName: item.album_name || "",
+        duration: item.duration || 0,
+        syncedLyrics: "1"
+      };
+      if (scoreLrcCandidate(cand, tokens, durationSec) >= 95) {
+        chosen = item;
+        break;
+      }
+    }
+    if (!chosen || !chosen.hash) return null;
+
+    const durMs = (chosen.duration || durationSec || 180) * 1000;
+    const kSearchUrl = `http://lyrics.kugou.com/search?ver=1&man=yes&client=pc&keyword=${encodeURIComponent(tokens.primaryTitle)}&duration=${durMs}&hash=${chosen.hash}`;
+    const kRes = await fetch(kSearchUrl, { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } });
+    if (!kRes.ok) return null;
+    const kJson = await kRes.json();
+    const candidate = kJson?.candidates?.[0];
+    if (!candidate?.id || !candidate?.accesskey) return null;
+
+    const dlUrl = `http://lyrics.kugou.com/download?ver=1&client=pc&id=${candidate.id}&accesskey=${candidate.accesskey}&fmt=lrc&charset=utf8`;
+    const dlRes = await fetch(dlUrl, { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } });
+    if (!dlRes.ok) return null;
+    const dlJson = await dlRes.json();
+    if (!dlJson?.content) return null;
+
+    const binary = atob(dlJson.content.trim());
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const decodedLrc = new TextDecoder("utf-8").decode(bytes);
+
+    const lines = parseLrcToTimeline(decodedLrc, durationSec);
+    if (lines.length >= 3) {
+      return {
+        source: "KugouProvider",
+        isSynced: true,
+        isAutoTimed: false,
+        syncedLyrics: decodedLrc,
+        plainLyrics: lines.map(l => l.text).join("\n"),
+        lines
+      };
+    }
+  } catch {}
+  return null;
+}
+
 async function resolveRealtimeLyrics(url) {
   let songId = url.searchParams.get("id") || url.searchParams.get("pid") || "";
   let trackName = url.searchParams.get("trackName") || url.searchParams.get("title") || "";
@@ -658,77 +921,127 @@ async function resolveRealtimeLyrics(url) {
   let albumName = url.searchParams.get("albumName") || url.searchParams.get("album") || "";
   let durationSec = parseInt(url.searchParams.get("duration") || "0", 10) || 0;
   const rawQ = url.searchParams.get("q") || "";
+  let extraArtists = [];
 
-  // If only songId was passed, look up metadata from JioSaavn first
-  if (songId && !trackName) {
+  if (songId && !songId.startsWith("audius_")) {
     try {
       const details = await fetchSaavnJson({ __call: "song.getDetails", pids: songId });
       const songObj = details?.[songId] || details?.songs?.[0] || Object.values(details || {})[0];
       if (songObj) {
         const enriched = enrichSaavnSong(songObj, url.origin);
-        trackName = enriched.title;
-        artistName = enriched.artist;
-        albumName = enriched.album;
-        durationSec = enriched.duration;
+        if (!trackName) trackName = enriched.title;
+        if (!artistName) artistName = enriched.artist;
+        if (!albumName || albumName === "OpenMuse") albumName = enriched.album;
+        if (!durationSec && enriched.duration) durationSec = enriched.duration;
+        if (Array.isArray(enriched.allArtists)) extraArtists = enriched.allArtists;
       }
     } catch {}
   }
 
-  const cleanTitle = cleanSongTitleForLyrics(trackName || rawQ);
-  const cleanArtist = cleanPrimaryArtistForLyrics(artistName);
+  const tokens = extractLyricsSearchTokens(trackName || rawQ, artistName, albumName, extraArtists);
 
-  // Stage 1: Try LRCLIB with cleaned title + primary artist + fallback queries
-  const searchQueries = [
-    [cleanTitle, cleanArtist].filter(Boolean).join(" "),
-    cleanTitle,
-    rawQ
-  ].map(s => s.trim()).filter(Boolean);
+  const lrcWinner = await searchLrclibCandidates(tokens, durationSec);
+  if (lrcWinner && lrcWinner.syncedLyrics) {
+    const lines = parseLrcToTimeline(lrcWinner.syncedLyrics, durationSec || Math.round(lrcWinner.duration || 0));
+    if (lines.length > 0) {
+      return {
+        source: "LrcLibProvider",
+        trackName: lrcWinner.trackName || tokens.primaryTitle,
+        artistName: lrcWinner.artistName || artistName,
+        duration: durationSec || Math.round(lrcWinner.duration || 0),
+        isSynced: true,
+        isAutoTimed: false,
+        syncedLyrics: lrcWinner.syncedLyrics,
+        plainLyrics: lrcWinner.plainLyrics || lines.map(l => l.text).join("\n"),
+        lines
+      };
+    }
+  }
 
-  for (const q of [...new Set(searchQueries)]) {
-    try {
-      const lrcRes = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`, {
-        headers: { "User-Agent": "OpenMuse-LiquidGlass/4.0 (https://projectvelo.tjcodewizard.workers.dev)" }
-      });
-      if (lrcRes.ok) {
-        const results = await lrcRes.json();
-        if (Array.isArray(results) && results.length > 0) {
-          // Score candidates by syncedLyrics availability, duration closeness, and artist match
-          const scored = results.map(item => {
-            let score = 0;
-            if (item.syncedLyrics) score += 100;
-            else if (item.plainLyrics) score += 25;
+  const [neteaseHit, kugouHit] = await Promise.all([
+    searchNeteaseLyrics(tokens, durationSec),
+    searchKugouLyrics(tokens, durationSec)
+  ]);
 
-            if (durationSec > 0 && item.duration) {
-              const diff = Math.abs(durationSec - item.duration);
-              if (diff <= 3) score += 50;
-              else if (diff <= 8) score += 25;
-              else if (diff > 25) score -= 30;
-            }
-            if (cleanArtist && item.artistName?.toLowerCase().includes(cleanArtist.toLowerCase())) {
-              score += 35;
-            }
-            if (cleanTitle && item.trackName?.toLowerCase() === cleanTitle.toLowerCase()) {
-              score += 25;
-            }
-            return { item, score };
-          }).sort((a, b) => b.score - a.score);
+  if (neteaseHit) {
+    return {
+      ...neteaseHit,
+      trackName: tokens.primaryTitle,
+      artistName,
+      duration: durationSec || 180
+    };
+  }
 
-          const winner = scored[0]?.item;
-          if (winner && (winner.syncedLyrics || winner.plainLyrics)) {
-            const isSynced = Boolean(winner.syncedLyrics);
-            const lines = isSynced
-              ? parseLrcToTimeline(winner.syncedLyrics, durationSec || Math.round(winner.duration || 0))
-              : buildEstimatedTimelineFromPlain(winner.plainLyrics, durationSec || Math.round(winner.duration || 180));
+  if (kugouHit) {
+    return {
+      ...kugouHit,
+      trackName: tokens.primaryTitle,
+      artistName,
+      duration: durationSec || 180
+    };
+  }
 
+  if (lrcWinner && lrcWinner.plainLyrics) {
+    const lines = buildEstimatedTimelineFromPlain(lrcWinner.plainLyrics, durationSec || Math.round(lrcWinner.duration || 180));
+    if (lines.length > 0) {
+      return {
+        source: "LrcLibPlainProvider",
+        trackName: lrcWinner.trackName || tokens.primaryTitle,
+        artistName: lrcWinner.artistName || artistName,
+        duration: durationSec || Math.round(lrcWinner.duration || 180),
+        isSynced: false,
+        isAutoTimed: true,
+        syncedLyrics: null,
+        plainLyrics: lrcWinner.plainLyrics,
+        lines
+      };
+    }
+  }
+
+  if (songId && !songId.startsWith("audius_")) {
+    for (const apiVer of ["4", ""]) {
+      try {
+        const params = { __call: "lyrics.getLyrics", lyrics_id: songId };
+        if (apiVer) params.api_version = apiVer;
+        const saavnLyrics = await fetchSaavnJson(params);
+        if (saavnLyrics?.lyrics) {
+          const plain = cleanText(saavnLyrics.lyrics.replace(/<br\s*\/?>/gi, "\n"));
+          const lines = buildEstimatedTimelineFromPlain(plain, durationSec || 180);
+          if (lines.length > 0) {
             return {
-              source: "LrcLibProvider",
-              trackName: winner.trackName || cleanTitle,
-              artistName: winner.artistName || cleanArtist,
-              duration: durationSec || Math.round(winner.duration || 0),
-              isSynced,
-              isAutoTimed: !isSynced,
-              syncedLyrics: winner.syncedLyrics || null,
-              plainLyrics: winner.plainLyrics || null,
+              source: "SaavnProvider",
+              trackName: tokens.primaryTitle,
+              artistName,
+              duration: durationSec || 180,
+              isSynced: false,
+              isAutoTimed: true,
+              syncedLyrics: null,
+              plainLyrics: plain,
+              lines
+            };
+          }
+        }
+      } catch {}
+    }
+  }
+
+  if (tokens.primaryTitle && tokens.artists[0]) {
+    try {
+      const ovhRes = await fetch(`https://api.lyrics.ovh/v1/${encodeURIComponent(tokens.artists[0])}/${encodeURIComponent(tokens.primaryTitle)}`);
+      if (ovhRes.ok) {
+        const ovhJson = await ovhRes.json();
+        if (ovhJson?.lyrics) {
+          const lines = buildEstimatedTimelineFromPlain(ovhJson.lyrics, durationSec || 180);
+          if (lines.length > 0) {
+            return {
+              source: "LyricsOvhProvider",
+              trackName: tokens.primaryTitle,
+              artistName: tokens.artists[0],
+              duration: durationSec || 180,
+              isSynced: false,
+              isAutoTimed: true,
+              syncedLyrics: null,
+              plainLyrics: ovhJson.lyrics,
               lines
             };
           }
@@ -737,38 +1050,9 @@ async function resolveRealtimeLyrics(url) {
     } catch {}
   }
 
-  // Stage 2: Fallback to JioSaavn Official Lyrics API
-  if (songId) {
-    try {
-      const saavnLyrics = await fetchSaavnJson({
-        __call: "lyrics.getLyrics",
-        api_version: "4",
-        lyrics_id: songId
-      });
-      if (saavnLyrics?.lyrics) {
-        const plain = cleanText(saavnLyrics.lyrics.replace(/<br\s*\/?>/gi, "\n"));
-        const lines = buildEstimatedTimelineFromPlain(plain, durationSec || 180);
-        return {
-          source: "SaavnProvider",
-          trackName: cleanTitle,
-          artistName: cleanArtist,
-          duration: durationSec || 180,
-          isSynced: false,
-          isAutoTimed: true,
-          syncedLyrics: null,
-          plainLyrics: plain,
-          lines
-        };
-      }
-    } catch {}
-  }
-
   return null;
 }
 
-// ============================================================================
-// 5. MAIN CLOUDFLARE WORKER FETCH ROUTER
-// ============================================================================
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
@@ -779,29 +1063,25 @@ export default {
     const path = url.pathname;
 
     try {
-      // 1. ZERO-BUFFER SMART STREAMER (/stream?url=...)
       if (path === "/stream" || path === "/proxy" || url.searchParams.has("streamUrl")) {
         const target = url.searchParams.get("url") || url.searchParams.get("streamUrl");
         return await handleSmartStream(request, target, url.origin, ctx);
       }
 
-      // 2. ONE-HOP SMART AUDIO PLAYER WITH MULTI-PROVIDER FALLBACK (/play?id=...&title=...&artist=...)
       if (path === "/play") {
         return await handleOneHopPlay(request, url, ctx);
       }
 
-      // 3. REAL-TIME TIME-SYNCED LYRICS ENGINE (/lyrics)
       if (path === "/lyrics") {
         return await withEdgeCache(request, ctx, 3600, async () => {
           const lyricsData = await resolveRealtimeLyrics(url);
           if (!lyricsData) {
             return jsonResponse({ error: "NoMatchFound", isSynced: false, lines: [] }, 404);
           }
-          return jsonResponse(lyricsData);
-        });
+          return jsonResponse(lyricsData, 200, { "X-Lyrics-Source": lyricsData.source || "Resolved" });
+        }, "v5-lyrics");
       }
 
-      // 4. DEEP ALBUM & PLAYLIST RESOLVER (/album?id=...)
       if (path === "/album") {
         const albumId = url.searchParams.get("id") || url.searchParams.get("albumid") || url.searchParams.get("token");
         return await withEdgeCache(request, ctx, 1800, async () => {
@@ -810,7 +1090,6 @@ export default {
         });
       }
 
-      // 5. SINGLE OR BATCH SONG RESOLVER (/song?id=...)
       if (path === "/song") {
         const pids = url.searchParams.get("id") || url.searchParams.get("pids");
         if (!pids) return jsonResponse({ error: "Missing ?id= parameter" }, 400);
@@ -824,7 +1103,6 @@ export default {
         });
       }
 
-      // 6. AUTOPLAY / ENDLESS RETENTION RECOMMENDATIONS (/reco?id=<songId>)
       if (path === "/reco") {
         const pid = url.searchParams.get("id") || url.searchParams.get("pid");
         if (!pid) return jsonResponse({ error: "Missing ?id=<songId>" }, 400);
@@ -842,7 +1120,6 @@ export default {
         });
       }
 
-      // 7. CURATED HOME & LAUNCH FEED (/home)
       if (path === "/home") {
         return await withEdgeCache(request, ctx, 900, async () => {
           const trendingData = await fetchSaavnJson({
@@ -862,18 +1139,17 @@ export default {
         });
       }
 
-      // 8. UNIFIED OR NDJSON SEARCH (/search?q=...)
       if (path === "/search") {
         return await handleSearchRoute(request, url, ctx);
       }
 
       return jsonResponse({
-        service: "ProjectVelo v4.0 — OpenMuse & Soundbound Edge Engine",
+        service: "ProjectVelo v5.0 — OpenMuse & Soundbound Edge Engine",
         status: "online",
         endpoints: {
           stream: `${url.origin}/stream?url=<target>`,
           play: `${url.origin}/play?id=<songId>&title=<title>&artist=<artist>`,
-          lyrics: `${url.origin}/lyrics?id=<songId>&trackName=<title>&artistName=<artist>&duration=<sec>`,
+          lyrics: `${url.origin}/lyrics?id=<songId>&trackName=<title>&artistName=<artist>&albumName=<album>&duration=<sec>`,
           home: `${url.origin}/home?lang=english,hindi,malayalam,tamil`,
           search: `${url.origin}/search?q=<query>&format=json`,
           album: `${url.origin}/album?id=<albumId_or_token>`,
@@ -891,16 +1167,12 @@ export default {
   }
 };
 
-// ============================================================================
-// 6. ONE-HOP SMART AUDIO STREAMER (/play) WITH MULTI-PROVIDER FALLBACK
-// ============================================================================
 async function handleOneHopPlay(request, url, ctx) {
   const songId = url.searchParams.get("id") || "";
   let rawMediaUrl = url.searchParams.get("url") || "";
   let title = url.searchParams.get("title") || "";
   let artist = url.searchParams.get("artist") || "";
 
-  // Step 1: If no direct media URL was given, resolve via JioSaavn song.getDetails
   if (!rawMediaUrl && songId && !songId.startsWith("audius_")) {
     try {
       const data = await fetchSaavnJson({ __call: "song.getDetails", pids: songId });
@@ -914,7 +1186,6 @@ async function handleOneHopPlay(request, url, ctx) {
     } catch {}
   }
 
-  // Step 2: Try streaming from JioSaavn CDN cascade
   if (rawMediaUrl) {
     const streamRes = await handleSmartStream(request, rawMediaUrl, url.origin, ctx, true);
     if (streamRes && (streamRes.status === 200 || streamRes.status === 206)) {
@@ -922,8 +1193,8 @@ async function handleOneHopPlay(request, url, ctx) {
     }
   }
 
-  // Step 3: Multi-Provider Fallback (Audius Full Stream -> Deezer Stream) if Saavn track is dead/locked
-  const fallbackQuery = [cleanSongTitleForLyrics(title), cleanPrimaryArtistForLyrics(artist)].filter(Boolean).join(" ").trim();
+  const tokens = extractLyricsSearchTokens(title, artist, "");
+  const fallbackQuery = [tokens.primaryTitle, tokens.artists[0] || ""].filter(Boolean).join(" ").trim();
   if (fallbackQuery) {
     try {
       const audiusSearch = await fetch(`https://discoveryprovider.audius.co/v1/tracks/search?query=${encodeURIComponent(fallbackQuery)}&app_name=OpenMuse`);
@@ -952,9 +1223,6 @@ async function handleOneHopPlay(request, url, ctx) {
   return jsonResponse({ error: "NoMatchFound", message: "No playable audio stream found across providers" }, 404);
 }
 
-// ============================================================================
-// 7. SMART ZERO-BUFFER STREAM HANDLER (Direct C++ ReadableStream Pass-Through)
-// ============================================================================
 async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFail = false) {
   if (!targetUrl) {
     return jsonResponse({ error: "Missing ?url= parameter" }, 400);
@@ -969,7 +1237,6 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
 
   const host = parsedTarget.hostname.toLowerCase();
 
-  // A. TRANSPARENT JIOSAAVN API INTERCEPTOR & AUTO-ENHANCER
   if (host.includes("jiosaavn.com") && parsedTarget.pathname.includes("api.php")) {
     const callType = parsedTarget.searchParams.get("__call") || "";
 
@@ -1008,7 +1275,6 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
     }
   }
 
-  // B. EDGE CACHE FOR 500x500 COVER ART IMAGES (7-Day Immutable Edge Cache)
   const isImage = /\.(jpg|jpeg|png|webp|svg|avif)(\?.*)?$/i.test(parsedTarget.pathname) || host.includes("c.saavncdn.com") || host.includes("sop.saavncdn.com");
   if (isImage && request.method === "GET" && !request.headers.has("Range")) {
     const cache = caches.default;
@@ -1045,7 +1311,6 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
     }
   }
 
-  // C. ZERO-BUFFER AUDIO STREAMING WITH 6-STAGE CDN CASCADE & MEMOIZATION
   const upstreamHeaders = new Headers({
     "User-Agent": SAAVN_HEADERS["User-Agent"],
     "Accept": request.headers.get("Accept") || "*/*",
@@ -1111,7 +1376,6 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
     }
   }
 
-  // Strip upstream compression header to prevent ERR_CONTENT_DECODING_FAILED
   resHeaders.delete("content-encoding");
 
   if (!resHeaders.has("accept-ranges")) {
@@ -1125,7 +1389,6 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
     resHeaders.set("X-Resolved-Bitrate", `${bitrateMatch[1]}kbps`);
   }
 
-  // Native C++ ReadableStream Pass-Through (Zero JS TransformStream overhead)
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
     statusText: upstreamRes.statusText,
@@ -1133,9 +1396,6 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
   });
 }
 
-// ============================================================================
-// 8. UNIFIED & NDJSON SEARCH ROUTE (/search)
-// ============================================================================
 async function handleSearchRoute(request, url, ctx) {
   const q = (url.searchParams.get("q") || url.searchParams.get("trackName") || "Trending").trim();
   const format = url.searchParams.get("format") || "ndjson";
@@ -1197,9 +1457,6 @@ async function handleSearchRoute(request, url, ctx) {
   });
 }
 
-// ============================================================================
-// 9. NORMALIZED EDGE CACHE & JSON UTILITIES
-// ============================================================================
 function jsonResponse(obj, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(obj), {
     status,
@@ -1211,12 +1468,13 @@ function jsonResponse(obj, status = 200, extraHeaders = {}) {
   });
 }
 
-async function withEdgeCache(request, ctx, ttlSeconds, computeFn) {
+async function withEdgeCache(request, ctx, ttlSeconds, computeFn, cacheNamespace = "v5") {
   if (request.method !== "GET") return await computeFn();
 
   const cache = caches.default;
   const parsed = new URL(request.url);
-  parsed.searchParams.sort(); // Canonicalized query parameters for maximum cache HITs
+  parsed.searchParams.set("_cv", cacheNamespace);
+  parsed.searchParams.sort();
   const cacheKey = new Request(parsed.toString(), { method: "GET" });
 
   const cached = await cache.match(cacheKey);
