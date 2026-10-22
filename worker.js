@@ -1,631 +1,656 @@
 /**
- * Ultra-Fast High-Concurrency Streaming Web Gateway for Cloudflare Workers
+ * Soundbound Zero-Buffer Streaming Cloudflare Worker (worker.js)
+ * Deploy via GitHub -> Cloudflare Workers / Pages
  */
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Range, If-Range, X-Custom-Headers, X-Custom-UA, X-Custom-Referer",
+  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Upstream-Status, X-Upstream-Url"
+};
+
+// All official Soundbound upstream repository mirrors
+const SOUNDBOUND_REPOS = {
+  "private-extensions": "https://soundbound.app/sources/private-extensions.json",
+  "gitlab-private-extensions": "https://gitlab.com/shabinder/soundbound/-/raw/main/Experimental-Sources/private-extensions.json",
+  "gitlab-sources": "https://gitlab.com/shabinder/soundbound/-/raw/main/Experimental-Sources/sources.json",
+  "gitlab-main": "https://gitlab.com/shabinder/soundbound/-/raw/main/Experimental-Sources/main.json",
+  "gitlab-hashes": "https://gitlab.com/shabinder/soundbound/-/raw/main/Experimental-Sources/hashes.json",
+  "gitlab-ota-validation": "https://gitlab.com/shabinder/soundbound/-/raw/main/Experimental-Sources/ota-validation.json"
+};
+
+// Complete vocabulary, models, and enums used across Soundbound & soundbound-extensions-lib
+const SOUNDBOUND_TERMS = {
+  SourceModel_Fields: [
+    "source_id",           // e.g. "in.shabinder.soundbound.extension.shabinder.spotify"
+    "source_name",         // e.g. "SpotifyProvider"
+    "source_version_code", // Int, e.g. 77
+    "source_version_name", // String, e.g. "0.31.77"
+    "link",                // Zipline manifest URL (.../manifest.zipline.json)
+    "source_type",         // SourceType enum
+    "enabledByDefault",    // Boolean
+    "icon_url",            // Optional String URL
+    "source_priority",     // Int (0 = highest priority, 99 = lowest)
+    "extraDeps"            // Optional Array<SourceModel>
+  ],
+  SourceType_Enum: [
+    "PROVIDER",              // Base / Lyrics / Utility provider (Genius, Musixmatch, LrcLib)
+    "METADATA_PROVIDER",     // Link/Chart metadata resolver (Odesli, SoundCharts)
+    "QUERYABLE_PROVIDER",    // Catalog/Playlist/Track search provider (Spotify, Gaana)
+    "DOWNLOADABLE_PROVIDER", // Direct audio stream & download provider (YouTube, Saavn, SoundCloud, Deezer, Audius, Jamendo)
+    "LYRICS_PROVIDER"        // Synced/Unsynced lyrics interface
+  ],
+  Known_Providers: [
+    "in.shabinder.soundbound.extension.shabinder.spotify",
+    "in.shabinder.soundbound.extension.shabinder.youtube",
+    "in.shabinder.soundbound.extension.shabinder.saavn",
+    "in.shabinder.soundbound.extension.shabinder.gaana",
+    "in.shabinder.soundbound.extension.shabinder.soundcloud",
+    "in.shabinder.soundbound.extension.shabinder.deezer",
+    "in.shabinder.soundbound.extension.shabinder.audius",
+    "in.shabinder.soundbound.extension.shabinder.jamendo",
+    "in.shabinder.soundbound.extension.shabinder.tidal",
+    "in.shabinder.soundbound.extension.shabinder.qobuz",
+    "in.shabinder.soundbound.extension.shabinder.genius",
+    "in.shabinder.soundbound.extension.shabinder.musixmatch",
+    "in.shabinder.soundbound.extension.shabinder.lrclib",
+    "in.shabinder.soundbound.extension.shabinder.odesli",
+    "in.shabinder.soundbound.extension.shabinder.soundcharts"
+  ],
+  QueryParams_Fields: [
+    "trackName",        // String
+    "trackArtists",     // List<String>
+    "trackDurationSec", // Int
+    "genre",            // List<String>
+    "year",             // Int?
+    "albumName",        // String?
+    "albumArtists",     // List<String>
+    "trackLink",        // String?
+    "isrc"              // String?
+  ],
+  TrackDetails_Fields: [
+    "title", "artists", "durationSec", "albumName", "albumArtists",
+    "year", "comment", "trackUrl", "videoID", "albumArtURL",
+    "source", "downloaded", "audioQuality", "audioFormat", "lyrics", "isrc", "trackNumber"
+  ],
+  DownloadQueryResult_Fields: [
+    "url",          // Direct media stream URL
+    "audioFormat",  // AudioFormat enum
+    "audioQuality", // AudioQuality enum
+    "headers"       // Map<String, String> required for streaming
+  ],
+  AudioQuality_Enum: ["KBPS128", "KBPS160", "KBPS192", "KBPS256", "KBPS320", "FLAC", "UNKNOWN"],
+  AudioFormat_Enum: ["MP3", "MP4", "OPUS", "FLAC", "OGG", "WAV", "AAC", "UNKNOWN"],
+  DownloadStatus_Enum: ["NotDownloaded", "Queued", "Downloading", "Converting", "Downloaded", "Failed"],
+  ZiplineManifest_Fields: ["unsigned", "modules", "version", "freshAtEpochMs", "signatures", "baseUrl", "mainModuleId", "mainFunction", "sha256", "dependsOnIds"],
+  Exceptions: ["NoMatchFound", "GeoLocationBlocked", "AuthRequiredException", "ThrowableWrapper"]
+};
+
+// Last-resort snapshot in case all upstream servers are unreachable
+const FALLBACK_EXTENSIONS = [
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.spotify","source_name":"SpotifyProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.spotify/77/manifest.zipline.json","source_type":"QUERYABLE_PROVIDER","enabledByDefault":true,"icon_url":"https://soundbound.app/assets/ic_spotify.svg","source_priority":0,"extraDeps":[{"source_id":"in.shabinder.soundbound.extension.shabinder.youtube","source_name":"YoutubeProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.youtube/77/manifest.zipline.json","source_type":"DOWNLOADABLE_PROVIDER","enabledByDefault":true,"icon_url":"https://soundbound.app/assets/ic_youtube.svg","source_priority":1}]},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.youtube","source_name":"YoutubeProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.youtube/77/manifest.zipline.json","source_type":"DOWNLOADABLE_PROVIDER","enabledByDefault":true,"icon_url":"https://soundbound.app/assets/ic_youtube.svg","source_priority":1},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.soundcharts","source_name":"SoundChartsProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.soundcharts/77/manifest.zipline.json","source_type":"METADATA_PROVIDER","enabledByDefault":true,"source_priority":1},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.saavn","source_name":"SaavnProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.saavn/77/manifest.zipline.json","source_type":"DOWNLOADABLE_PROVIDER","enabledByDefault":true,"icon_url":"https://soundbound.app/assets/ic_jiosaavn.svg","source_priority":2},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.odesli","source_name":"OdesliProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.odesli/77/manifest.zipline.json","source_type":"METADATA_PROVIDER","enabledByDefault":true,"source_priority":2},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.gaana","source_name":"GaanaProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.gaana/77/manifest.zipline.json","source_type":"QUERYABLE_PROVIDER","enabledByDefault":true,"icon_url":"https://soundbound.app/assets/ic_gaana.svg","source_priority":4},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.soundcloud","source_name":"SoundcloudProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.soundcloud/77/manifest.zipline.json","source_type":"DOWNLOADABLE_PROVIDER","enabledByDefault":true,"icon_url":"https://soundbound.app/assets/ic_soundcloud.svg","source_priority":5},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.deezer","source_name":"DeezerProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.deezer/77/manifest.zipline.json","source_type":"DOWNLOADABLE_PROVIDER","enabledByDefault":true,"icon_url":"https://upload.wikimedia.org/wikipedia/commons/0/0e/Deezer_New_Icon.svg","source_priority":5},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.musixmatch","source_name":"MusixmatchProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.musixmatch/77/manifest.zipline.json","source_type":"PROVIDER","enabledByDefault":true,"icon_url":"https://play-lh.googleusercontent.com/Gw0PKgbVNm5nbtJ7wIKJPRdO_C75yBp1MXyCZg641EZ5IYMv05lcBKXN-rzgVo3-OUQ=w240-h480","source_priority":40},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.lrclib","source_name":"LrcLibProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.lrclib/77/manifest.zipline.json","source_type":"PROVIDER","enabledByDefault":true,"icon_url":"https://lrclib.net/assets/lrclib-370c57eb.png","source_priority":50},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.genius","source_name":"GeniusProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.genius/77/manifest.zipline.json","source_type":"PROVIDER","enabledByDefault":true,"icon_url":"https://assets.genius.com/images/apple-touch-icon.png","source_priority":60},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.audius","source_name":"AudiusProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.audius/77/manifest.zipline.json","source_type":"DOWNLOADABLE_PROVIDER","enabledByDefault":false,"icon_url":"https://soundbound.app/assets/ic_audius.svg","source_priority":98},
+  {"source_id":"in.shabinder.soundbound.extension.shabinder.jamendo","source_name":"JamendoProvider","source_version_code":77,"source_version_name":"0.31.77","link":"https://sources.soundbound.app/in.shabinder.soundbound.extension.shabinder.jamendo/77/manifest.zipline.json","source_type":"DOWNLOADABLE_PROVIDER","enabledByDefault":false,"icon_url":"https://soundbound.app/assets/ic_jamendo.svg","source_priority":99}
+];
 
 export default {
   async fetch(request, env, ctx) {
-    return await handleGateway(request);
+    // Handle CORS preflight immediately
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    try {
+      // 1. ZERO-BUFFER RAW STREAM PROXY: /stream?url=<encoded_url>
+      if (path === "/stream" || path === "/proxy" || url.searchParams.has("streamUrl")) {
+        const target = url.searchParams.get("url") || url.searchParams.get("streamUrl");
+        return await handleZeroBufferStream(request, target);
+      }
+
+      // 2. NDJSON STREAMING REPO & ZIPLINE MANIFEST COLLECTOR: /collect
+      if (path === "/collect") {
+        return handleStreamingRepoCollect(request, url, ctx);
+      }
+
+      // 3. NDJSON STREAMING MULTI-PROVIDER TRACK/LYRICS/METADATA SEARCH: /search
+      if (path === "/search") {
+        return handleStreamingTrackSearch(request, url, ctx);
+      }
+
+      // 4. SOUNDBOUND TERMS & SCHEMA REFERENCE: /terms
+      if (path === "/terms") {
+        return new Response(JSON.stringify({
+          repos: SOUNDBOUND_REPOS,
+          terms: SOUNDBOUND_TERMS
+        }, null, 2), {
+          status: 200,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+
+      // Default: Return usage & health status
+      return new Response(JSON.stringify({
+        service: "Soundbound Streaming Worker",
+        endpoints: {
+          zeroBufferStreamProxy: `${url.origin}/stream?url=https://soundbound.app/sources/private-extensions.json`,
+          ndjsonRepoCollector: `${url.origin}/collect?repo=private-extensions&resolveManifests=false`,
+          ndjsonTrackSearch: `${url.origin}/search?trackName=Blinding+Lights&trackArtists=The+Weeknd`,
+          soundboundTerms: `${url.origin}/terms`
+        }
+      }, null, 2), {
+        status: 200,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json; charset=utf-8" }
+      });
+
+    } catch (err) {
+      return new Response(JSON.stringify({
+        error: "ThrowableWrapper",
+        message: err.message || String(err),
+        stackTrace: err.stack || ""
+      }), {
+        status: 500,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json; charset=utf-8" }
+      });
+    }
   }
 };
 
-// ---------------------------------------------------------------------------
-// 1. AD-BLOCKING & TELEMETRY SHIELD
-// ---------------------------------------------------------------------------
-const AD_PATTERNS = [
-  /(^|\.)doubleclick\.net$/i,
-  /(^|\.)google-analytics\.com$/i,
-  /(^|\.)googlesyndication\.com$/i,
-  /(^|\.)googleadservices\.com$/i,
-  /(^|\.)adservice\.google\./i,
-  /(^|\.)adnxs\.com$/i,
-  /(^|\.)advertising\.com$/i,
-  /(^|\.)criteo\.(com|net)$/i,
-  /(^|\.)outbrain\.com$/i,
-  /(^|\.)taboola\.com$/i,
-  /(^|\.)scorecardresearch\.com$/i,
-  /(^|\.)amazon-adsystem\.com$/i,
-  /(^|\.)pubmatic\.com$/i,
-  /(^|\.)rubiconproject\.com$/i,
-  /(^|\.)moatads\.com$/i,
-  /(^|\.)imasdk\.googleapis\.com$/i,
-  /(^|\.)pagead2\.googlesyndication\.com$/i,
-  /(^|\.)hotjar\.com$/i,
-  /(^|\.)clarity\.ms$/i
-];
-
-function isBlocked(urlStr) {
-  try {
-    const host = new URL(urlStr).hostname;
-    return AD_PATTERNS.some(p => p.test(host));
-  } catch {
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 2. ROUTING & TARGET EXTRACTION ENGINE
-// ---------------------------------------------------------------------------
-function extractTarget(request) {
-  const reqUrl = new URL(request.url);
-
-  // Mode 1: Path Prefix -> /p/https://example.com/... or /p/http://...
-  if (reqUrl.pathname.startsWith('/p/')) {
-    const raw = reqUrl.pathname.slice(3) + reqUrl.search;
-    return normalizeUrl(raw);
-  }
-
-  // Mode 2: Direct Protocol Path -> /https://example.com/...
-  const matchDirect = reqUrl.pathname.match(/^\/(https?:\/?.+)/i);
-  if (matchDirect) {
-    return normalizeUrl(matchDirect[1] + reqUrl.search);
-  }
-
-  // Mode 3: Query Parameter -> ?url=https://example.com
-  const qUrl = reqUrl.searchParams.get('url');
-  if (qUrl) {
-    return normalizeUrl(qUrl);
-  }
-
-  // Mode 4: Transparent Sub-resource Referer Fallback
-  // (Fixes relative assets requested directly like /style.css or /chunk.js)
-  const referer = request.headers.get('Referer');
-  if (referer) {
-    try {
-      const refUrl = new URL(referer);
-      let refTarget = null;
-
-      if (refUrl.pathname.startsWith('/p/')) {
-        refTarget = refUrl.pathname.slice(3) + refUrl.search;
-      } else if (refUrl.searchParams.has('url')) {
-        refTarget = refUrl.searchParams.get('url');
-      }
-
-      if (refTarget) {
-        const baseTarget = new URL(normalizeUrl(refTarget));
-        return new URL(reqUrl.pathname + reqUrl.search, baseTarget.origin).href;
-      }
-    } catch (_) {}
-  }
-
-  // Mode 5: Cookie Session Target Fallback
-  const cookie = request.headers.get('Cookie') || '';
-  const sessionMatch = cookie.match(/(?:^|;\s*)__pw_target=([^;]+)/);
-  if (sessionMatch && reqUrl.pathname !== '/') {
-    try {
-      const sessionOrigin = decodeURIComponent(sessionMatch[1]);
-      return new URL(reqUrl.pathname + reqUrl.search, sessionOrigin).href;
-    } catch (_) {}
-  }
-
-  return null;
-}
-
-function normalizeUrl(u) {
-  if (!u) return null;
-  u = decodeURIComponent(u);
-  u = u.replace(/^(https?:\/)(?!\/)/i, '$1/'); // fix single slash
-  if (!/^https?:\/\//i.test(u)) {
-    // If not a URL, resolve as a web search
-    if (!u.includes('.') || u.includes(' ')) {
-      return `https://www.google.com/search?q=${encodeURIComponent(u)}`;
-    }
-    u = 'https://' + u;
-  }
-  return u;
-}
-
-// ---------------------------------------------------------------------------
-// 3. CORE GATEWAY HANDLER
-// ---------------------------------------------------------------------------
-async function handleGateway(request) {
-  const reqUrl = new URL(request.url);
-
-  // A. Instant CORS Preflight Resolution
-  if (request.method === 'OPTIONS') {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD',
-        'Access-Control-Allow-Headers': '*',
-        'Access-Control-Max-Age': '86400'
-      }
-    });
-  }
-
-  const targetUrl = extractTarget(request);
-
-  // B. Serve Landing Dashboard if visiting the root without a target
+/**
+ * 1. ZERO-BUFFER STREAM HANDLER
+ * Never downloads or buffers the file into Worker memory.
+ * Pipes the ReadableStream directly from upstream to client with Range support.
+ */
+async function handleZeroBufferStream(request, targetUrl) {
   if (!targetUrl) {
-    if (reqUrl.pathname === '/') {
-      return renderDashboard(reqUrl.origin);
-    }
-    return new Response('404 Target Not Found', { status: 404 });
+    return new Response(JSON.stringify({ error: "Missing ?url= parameter" }), {
+      status: 400,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" }
+    });
   }
 
   let parsedTarget;
   try {
     parsedTarget = new URL(targetUrl);
   } catch {
-    return new Response('Malformed Target URL', { status: 400 });
-  }
-
-  // C. Edge Ad & Telemetry Blocker
-  if (isBlocked(parsedTarget.href)) {
-    if (parsedTarget.pathname.endsWith('.js') || request.headers.get('Sec-Fetch-Dest') === 'script') {
-      return new Response('/* [Gateway] Ad blocked */', {
-        status: 200,
-        headers: { 'Content-Type': 'application/javascript', 'Access-Control-Allow-Origin': '*' }
-      });
-    }
-    return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*' } });
-  }
-
-  // D. WebSocket Direct Passthrough
-  const isWs = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
-  if (isWs) {
-    const wsHeaders = new Headers(request.headers);
-    wsHeaders.set('Host', parsedTarget.host);
-    wsHeaders.set('Origin', parsedTarget.origin);
-    return fetch(parsedTarget.href, {
-      method: request.method,
-      headers: wsHeaders
+    return new Response(JSON.stringify({ error: "Invalid target URL" }), {
+      status: 400,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" }
     });
   }
 
-  // E. Header Spoofing & Fingerprint Emulation
-  const proxyHeaders = new Headers(request.headers);
+  const reqUrl = new URL(request.url);
+  const upstreamHeaders = new Headers();
 
-  // Strip cloud & internal hop headers
-  const hopHeaders = [
-    'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker',
-    'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
-    'cdn-loop', 'x-amzn-trace-id'
-  ];
-  hopHeaders.forEach(h => proxyHeaders.delete(h));
+  // Mimic Soundbound Android/JVM OkHttp client or custom UA
+  upstreamHeaders.set(
+    "User-Agent",
+    reqUrl.searchParams.get("ua") ||
+    request.headers.get("X-Custom-UA") ||
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+  );
+  upstreamHeaders.set("Accept", request.headers.get("Accept") || "*/*");
 
-  // Set destination headers
-  proxyHeaders.set('Host', parsedTarget.host);
-  proxyHeaders.set('Origin', parsedTarget.origin);
-  proxyHeaders.set('Referer', parsedTarget.href);
-
-  // Video Streaming Optimization: Pass through Range headers cleanly
-  if (request.headers.has('range')) {
-    proxyHeaders.set('Range', request.headers.get('range'));
+  // Forward Range headers for partial audio/file streaming (HTTP 206)
+  if (request.headers.has("Range")) {
+    upstreamHeaders.set("Range", request.headers.get("Range"));
+  }
+  if (request.headers.has("If-Range")) {
+    upstreamHeaders.set("If-Range", request.headers.get("If-Range"));
   }
 
-  // Modern browser UA and Client-Hints
-  proxyHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
-  proxyHeaders.set('Sec-CH-UA', '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"');
-  proxyHeaders.set('Sec-CH-UA-Mobile', '?0');
-  proxyHeaders.set('Sec-CH-UA-Platform', '"Windows"');
-  proxyHeaders.set('Accept-Language', 'en-US,en;q=0.9');
+  // Optional custom Referer or JSON headers
+  const customReferer = reqUrl.searchParams.get("referer") || request.headers.get("X-Custom-Referer");
+  if (customReferer) {
+    upstreamHeaders.set("Referer", customReferer);
+  } else {
+    upstreamHeaders.set("Referer", parsedTarget.origin + "/");
+  }
 
-  // Avoid unsupported compressions (e.g., Zstandard) that could break edge decoders
-  proxyHeaders.set('Accept-Encoding', 'gzip, deflate, br');
+  const customHeadersRaw = reqUrl.searchParams.get("headers") || request.headers.get("X-Custom-Headers");
+  if (customHeadersRaw) {
+    try {
+      const parsed = JSON.parse(customHeadersRaw);
+      for (const [k, v] of Object.entries(parsed)) upstreamHeaders.set(k, String(v));
+    } catch {}
+  }
 
-  // Bypass Google Consent loop wall
-  if (parsedTarget.hostname.includes('google.')) {
-    let currentCookie = proxyHeaders.get('Cookie') || '';
-    if (!currentCookie.includes('CONSENT=')) {
-      currentCookie = (currentCookie ? currentCookie + '; ' : '') + 'CONSENT=YES+cb.20230531-04-p0.en+FX+999';
-      proxyHeaders.set('Cookie', currentCookie);
+  const upstreamRes = await fetch(parsedTarget.toString(), {
+    method: request.method === "HEAD" ? "HEAD" : "GET",
+    headers: upstreamHeaders,
+    redirect: "follow"
+  });
+
+  // Prepare pass-through response headers
+  const resHeaders = new Headers(CORS_HEADERS);
+  const passThroughHeaderNames = [
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "cache-control",
+    "etag",
+    "last-modified",
+    "content-disposition"
+  ];
+
+  for (const name of passThroughHeaderNames) {
+    if (upstreamRes.headers.has(name)) {
+      resHeaders.set(name, upstreamRes.headers.get(name));
     }
   }
 
-  // Clean internal proxy cookie from outgoing request
-  const rawCookie = proxyHeaders.get('Cookie') || '';
-  const filteredCookie = rawCookie.replace(/(?:^|;\s*)__pw_target=[^;]*/g, '').trim().replace(/^;+|;+$/g, '');
-  if (filteredCookie) {
-    proxyHeaders.set('Cookie', filteredCookie);
-  } else {
-    proxyHeaders.delete('Cookie');
+  resHeaders.set("X-Upstream-Status", String(upstreamRes.status));
+  resHeaders.set("X-Upstream-Url", upstreamRes.url || parsedTarget.toString());
+
+  if (!upstreamRes.body) {
+    return new Response(null, { status: upstreamRes.status, headers: resHeaders });
   }
 
-  // F. Execute Outbound Fetch
-  const fetchInit = {
-    method: request.method,
-    headers: proxyHeaders,
-    redirect: 'manual'
+  // Stream bytes directly without buffering into Worker RAM
+  const { readable, writable } = new TransformStream();
+  upstreamRes.body.pipeTo(writable).catch(() => {});
+
+  return new Response(readable, {
+    status: upstreamRes.status,
+    statusText: upstreamRes.statusText,
+    headers: resHeaders
+  });
+}
+
+/**
+ * 2. NDJSON STREAMING REPO & ZIPLINE MANIFEST COLLECTOR
+ * Streams each Soundbound SourceModel & optional manifest.zipline.json line-by-line
+ * as soon as data arrives, so the client sees items immediately.
+ */
+function handleStreamingRepoCollect(request, url, ctx) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  const writeLine = async (obj) => {
+    await writer.write(encoder.encode(JSON.stringify(obj) + "\n"));
   };
 
-  if (!['GET', 'HEAD'].includes(request.method)) {
-    fetchInit.body = request.body;
-    fetchInit.duplex = 'half';
-  }
+  const repoKey = url.searchParams.get("repo") || "private-extensions";
+  const customRepoUrl = url.searchParams.get("url");
+  const resolveManifests = url.searchParams.get("resolveManifests") === "true";
 
-  const proxyBase = `${reqUrl.origin}/p/`;
+  // Filter parameters matching Soundbound terms
+  const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+  const sourceTypeFilter = url.searchParams.get("source_type") || "ALL";
+  const enabledFilter = url.searchParams.get("enabledByDefault") || "ALL";
 
-  try {
-    const response = await fetch(parsedTarget.href, fetchInit);
+  ctx.waitUntil((async () => {
+    try {
+      // Determine priority list of URLs to try
+      const candidateUrls = customRepoUrl
+        ? [customRepoUrl]
+        : [
+            SOUNDBOUND_REPOS[repoKey] || SOUNDBOUND_REPOS["private-extensions"],
+            SOUNDBOUND_REPOS["gitlab-private-extensions"],
+            SOUNDBOUND_REPOS["gitlab-sources"],
+            SOUNDBOUND_REPOS["gitlab-main"]
+          ];
 
-    // G. Handle HTTP Redirects (301, 302, 307, 308)
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const loc = response.headers.get('Location');
-      if (loc) {
-        const absoluteRedirect = new URL(loc, parsedTarget.href).href;
-        return Response.redirect(`${proxyBase}${encodeURIComponent(absoluteRedirect)}`, response.status);
-      }
-    }
+      let sourcesList = null;
+      let usedUrl = null;
 
-    // H. Response Headers Unlocking
-    const resHeaders = new Headers(response.headers);
-    resHeaders.set('Access-Control-Allow-Origin', '*');
-    resHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD');
-    resHeaders.set('Access-Control-Allow-Headers', '*');
-    resHeaders.set('Access-Control-Expose-Headers', '*');
-
-    // Strip frame isolation and security policies that break proxies
-    resHeaders.delete('X-Frame-Options');
-    resHeaders.delete('Content-Security-Policy');
-    resHeaders.delete('Content-Security-Policy-Report-Only');
-    resHeaders.delete('Cross-Origin-Opener-Policy');
-    resHeaders.delete('Cross-Origin-Embedder-Policy');
-    resHeaders.delete('Cross-Origin-Resource-Policy');
-    resHeaders.delete('Clear-Site-Data');
-
-    // Retain origin memory in cookie for relative resources
-    resHeaders.append('Set-Cookie', `__pw_target=${encodeURIComponent(parsedTarget.origin)}; Path=/; SameSite=Lax; Secure`);
-
-    // Rewrite Set-Cookie to work on current domain
-    if (resHeaders.has('set-cookie')) {
-      const cookies = resHeaders.getSetCookie();
-      resHeaders.delete('set-cookie');
-      for (const c of cookies) {
-        const rewritten = c
-          .replace(/Domain=[^;]+;?/gi, '')
-          .replace(/Path=[^;]+;?/gi, 'Path=/;')
-          .replace(/SameSite=Strict;?/gi, 'SameSite=Lax;');
-        resHeaders.append('set-cookie', rewritten);
-      }
-    }
-
-    // I. ZERO-COPY STREAMING PIPELINE
-    // If it's a Video/Audio chunk (206 Partial Content), CSS, JS, Image, or JSON, STREAM DIRECTLY!
-    const contentType = (resHeaders.get('Content-Type') || '').toLowerCase();
-    const isHtml = response.status === 200 && (contentType.includes('text/html') || contentType.includes('application/xhtml+xml'));
-
-    if (!isHtml || response.status === 206) {
-      // Ensure Byte-Range seeking is preserved for media
-      if (response.headers.has('content-range')) {
-        resHeaders.set('Content-Range', response.headers.get('content-range'));
-      }
-      if (response.headers.has('accept-ranges')) {
-        resHeaders.set('Accept-Ranges', response.headers.get('accept-ranges'));
-      }
-
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: resHeaders
-      });
-    }
-
-    // J. Process HTML through the lightweight sandbox injector
-    return injectSandbox(
-      new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: resHeaders
-      }),
-      parsedTarget.href,
-      proxyBase
-    );
-
-  } catch (err) {
-    return new Response(`[Gateway Error]: ${err.message}`, {
-      status: 502,
-      headers: { 'Access-Control-Allow-Origin': '*' }
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 4. CLIENT-SIDE SANDBOX INJECTOR (In-Browser Virtual DOM)
-// ---------------------------------------------------------------------------
-function injectSandbox(response, targetUrl, proxyBase) {
-  const targetOrigin = new URL(targetUrl).origin;
-
-  const sandboxScript = `
-    <script>
-      (() => {
-        const PROXY_BASE = ${JSON.stringify(proxyBase)};
-        const TARGET_URL = ${JSON.stringify(targetUrl)};
-        const TARGET_ORIGIN = ${JSON.stringify(targetOrigin)};
-
-        function qualify(u) {
-          if (!u || typeof u !== 'string') return u;
-          if (u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('javascript:') || u.startsWith('#')) return u;
-          if (u.startsWith(PROXY_BASE)) return u;
-          try {
-            const abs = new URL(u, TARGET_URL).href;
-            return PROXY_BASE + encodeURIComponent(abs);
-          } catch (e) {
-            return u;
-          }
-        }
-
-        // 1. Spoof Location & Domain
+      for (const candidate of [...new Set(candidateUrls)]) {
         try {
-          Object.defineProperty(document, 'domain', { get: () => new URL(TARGET_URL).hostname });
-        } catch (_) {}
-
-        // 2. Intercept window.fetch
-        const nativeFetch = window.fetch;
-        window.fetch = function(resource, init) {
-          if (typeof resource === 'string') {
-            resource = qualify(resource);
-          } else if (resource instanceof URL) {
-            resource = qualify(resource.href);
-          } else if (resource instanceof Request) {
-            resource = new Request(qualify(resource.url), resource);
-          }
-          return nativeFetch.call(this, resource, init);
-        };
-
-        // 3. Intercept XMLHttpRequest
-        const nativeOpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function(method, url, async, user, pass) {
-          return nativeOpen.call(this, method, qualify(url), async !== false, user, pass);
-        };
-
-        // 4. Intercept WebSockets
-        const NativeWebSocket = window.WebSocket;
-        window.WebSocket = function(url, protocols) {
-          try {
-            const parsed = new URL(url, TARGET_URL);
-            const scheme = parsed.protocol === 'wss:' ? 'https:' : 'http:';
-            const httpUrl = scheme + '//' + parsed.host + parsed.pathname + parsed.search;
-            const proxied = new URL(qualify(httpUrl), window.location.href);
-            proxied.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            url = proxied.href;
-          } catch (_) {}
-          return protocols ? new NativeWebSocket(url, protocols) : new NativeWebSocket(url);
-        };
-        window.WebSocket.prototype = NativeWebSocket.prototype;
-
-        // 5. Intercept SSE (Server-Sent Events)
-        if (window.EventSource) {
-          const NativeEventSource = window.EventSource;
-          window.EventSource = function(url, cfg) {
-            return new NativeEventSource(qualify(url), cfg);
-          };
-          window.EventSource.prototype = NativeEventSource.prototype;
-        }
-
-        // 6. Intercept History pushState & replaceState
-        const nativePush = history.pushState;
-        history.pushState = function(state, title, url) {
-          if (url) {
-            try {
-              arguments[2] = PROXY_BASE + encodeURIComponent(new URL(url, TARGET_URL).href);
-            } catch (_) {}
-          }
-          return nativePush.apply(this, arguments);
-        };
-
-        const nativeReplace = history.replaceState;
-        history.replaceState = function(state, title, url) {
-          if (url) {
-            try {
-              arguments[2] = PROXY_BASE + encodeURIComponent(new URL(url, TARGET_URL).href);
-            } catch (_) {}
-          }
-          return nativeReplace.apply(this, arguments);
-        };
-
-        // 7. Prevent popups from breaking the proxy
-        window.open = function(url) {
-          if (url) window.location.href = qualify(url);
-          return window;
-        };
-
-        // 8. Gracefully disable ServiceWorker registration
-        if (navigator.serviceWorker) {
-          navigator.serviceWorker.register = () => Promise.reject(new Error('[Gateway] ServiceWorker disabled.'));
-        }
-
-        // 9. Intercept Links & Navigation
-        document.addEventListener('click', e => {
-          const a = e.target.closest('a');
-          if (a && a.href && !a.href.startsWith('javascript:') && !a.href.startsWith('#')) {
-            e.preventDefault();
-            window.location.href = qualify(a.getAttribute('href') || a.href);
-          }
-        }, true);
-
-        // 10. Intercept Form Submissions
-        document.addEventListener('submit', e => {
-          const form = e.target;
-          if (form.action) {
-            e.preventDefault();
-            const fullAction = new URL(form.getAttribute('action') || '', TARGET_URL);
-            if ((form.method || 'get').toLowerCase() === 'get') {
-              const data = new FormData(form);
-              const params = new URLSearchParams(data);
-              fullAction.search = params.toString();
-              window.location.href = qualify(fullAction.href);
-            } else {
-              form.action = qualify(fullAction.href);
-              form.submit();
+          await writeLine({ event: "status", message: `Connecting to ${candidate}...`, url: candidate });
+          const res = await fetch(candidate, {
+            headers: {
+              "User-Agent": "Soundbound/2.1.0 (Android; Zipline)",
+              "Accept": "application/json"
+            }
+          });
+          if (res.ok) {
+            const json = await res.json();
+            if (Array.isArray(json)) {
+              sourcesList = json;
+              usedUrl = candidate;
+              break;
+            } else if (json && typeof json === "object") {
+              // For object-based files like hashes.json or ota-validation.json
+              await writeLine({ event: "raw_object", repoUrl: candidate, data: json });
+              await writer.close();
+              return;
             }
           }
-        }, true);
-      })();
-    </script>
-    <style>
-      /* Cosmetic Ad Blocker */
-      .adsbygoogle, [id*="-ad-"], [class*="ad-unit"], [class*="advertisement"],
-      div[id*="google_ads"], div[data-ad], .video-ad-overlay {
-        display: none !important;
-        visibility: hidden !important;
-        height: 0 !important;
+        } catch (e) {
+          await writeLine({ event: "warn", message: `Mirror failed: ${candidate} (${e.message})` });
+        }
       }
-    </style>
-  `;
 
-  class HeadRewriter {
-    element(element) {
-      element.prepend(sandboxScript, { html: true });
-    }
-  }
-
-  class MetaStripper {
-    element(element) {
-      const httpEquiv = (element.getAttribute('http-equiv') || '').toLowerCase();
-      if (httpEquiv === 'content-security-policy') {
-        element.remove();
+      if (!sourcesList) {
+        sourcesList = FALLBACK_EXTENSIONS;
+        usedUrl = "embedded://fallback-private-extensions.json";
+        await writeLine({ event: "status", message: "Using embedded Soundbound fallback manifest", url: usedUrl });
+      } else {
+        await writeLine({ event: "status", message: `Streaming from ${usedUrl}`, totalCount: sourcesList.length });
       }
-    }
-  }
 
-  // Stream HTML modifications without buffering the whole response
-  return new HTMLRewriter()
-    .on('head', new HeadRewriter())
-    .on('meta', new MetaStripper())
-    .transform(response);
+      // Stream each matching SourceModel immediately
+      for (const item of sourcesList) {
+        if (sourceTypeFilter !== "ALL" && item.source_type !== sourceTypeFilter) continue;
+        if (enabledFilter !== "ALL" && String(item.enabledByDefault) !== enabledFilter) continue;
+
+        if (q) {
+          const hay = [
+            item.source_id,
+            item.source_name,
+            item.source_type,
+            item.source_version_name,
+            String(item.source_version_code),
+            item.link,
+            ...(item.extraDeps || []).map(d => `${d.source_id} ${d.source_name}`)
+          ].filter(Boolean).join(" ").toLowerCase();
+          if (!hay.includes(q)) continue;
+        }
+
+        const enrichedItem = {
+          ...item,
+          workerStreamManifestUrl: item.link ? `${url.origin}/stream?url=${encodeURIComponent(item.link)}` : null
+        };
+
+        await writeLine({
+          event: "SourceModel",
+          repoUrl: usedUrl,
+          data: enrichedItem
+        });
+
+        // Optionally fetch and stream the Zipline manifest details for each provider
+        if (resolveManifests && item.link) {
+          try {
+            const zRes = await fetch(item.link, {
+              headers: { "User-Agent": "Soundbound/2.1.0 (Android; Zipline)" }
+            });
+            if (zRes.ok) {
+              const zManifest = await zRes.json();
+              const moduleKeys = zManifest.modules ? Object.keys(zManifest.modules) : [];
+              await writeLine({
+                event: "ZiplineManifest",
+                source_id: item.source_id,
+                source_name: item.source_name,
+                version: zManifest.version,
+                freshAtEpochMs: zManifest.freshAtEpochMs,
+                unsigned: zManifest.unsigned,
+                moduleCount: moduleKeys.length,
+                modules: zManifest.modules
+              });
+            }
+          } catch (zErr) {
+            await writeLine({
+              event: "ZiplineManifestError",
+              source_id: item.source_id,
+              error: zErr.message
+            });
+          }
+        }
+      }
+
+      await writeLine({ event: "done", timestamp: Date.now() });
+    } catch (err) {
+      await writeLine({ event: "error", error: "ThrowableWrapper", message: err.message });
+    } finally {
+      await writer.close();
+    }
+  })());
+
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff"
+    }
+  });
 }
 
-// ---------------------------------------------------------------------------
-// 5. NATIVE CLIENT DASHBOARD
-// ---------------------------------------------------------------------------
-function renderDashboard(origin) {
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Edge Gateway</title>
-  <style>
-    :root {
-      --bg: #0b0f19;
-      --card: #151d30;
-      --accent: #3b82f6;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
+/**
+ * 3. NDJSON STREAMING MULTI-PROVIDER SEARCH (Soundbound QueryParams -> TrackDetails / DownloadQueryResult)
+ * Concurrently queries Soundbound-compatible public provider endpoints and streams results as they arrive.
+ */
+function handleStreamingTrackSearch(request, url, ctx) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  const writeLine = async (obj) => {
+    await writer.write(encoder.encode(JSON.stringify(obj) + "\n"));
+  };
+
+  // Extract Soundbound QueryParams
+  const queryParams = {
+    trackName: url.searchParams.get("trackName") || url.searchParams.get("q") || "",
+    trackArtists: (url.searchParams.get("trackArtists") || "").split(",").map(s => s.trim()).filter(Boolean),
+    trackDurationSec: parseInt(url.searchParams.get("trackDurationSec") || "0", 10) || null,
+    albumName: url.searchParams.get("albumName") || null,
+    trackLink: url.searchParams.get("trackLink") || null,
+    isrc: url.searchParams.get("isrc") || null
+  };
+
+  const fullQuery = [queryParams.trackName, ...queryParams.trackArtists].join(" ").trim();
+
+  ctx.waitUntil((async () => {
+    try {
+      await writeLine({ event: "QueryParams", data: queryParams });
+
+      if (!fullQuery && !queryParams.trackLink) {
+        await writeLine({
+          event: "error",
+          exception: "NoMatchFound",
+          message: "Provide ?trackName=... (or ?q=...) or ?trackLink=..."
+        });
+        await writer.close();
+        return;
+      }
+
+      const tasks = [];
+
+      // Task A: JioSaavn (SaavnProvider - DOWNLOADABLE_PROVIDER)
+      if (fullQuery) {
+        tasks.push((async () => {
+          try {
+            const saavnUrl = `https://www.jiosaavn.com/api.php?__call=autocomplete.get&_format=json&_marker=0&cc=in&includeMetaTags=1&query=${encodeURIComponent(fullQuery)}`;
+            const res = await fetch(saavnUrl, {
+              headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+            });
+            if (res.ok) {
+              const data = await res.json();
+              const songs = (data && data.songs && data.songs.data) || [];
+              for (const s of songs) {
+                await writeLine({
+                  event: "TrackDetails",
+                  source_id: "in.shabinder.soundbound.extension.shabinder.saavn",
+                  source_name: "SaavnProvider",
+                  source_type: "DOWNLOADABLE_PROVIDER",
+                  data: {
+                    title: s.title,
+                    artists: [s.more_info?.primary_artists || s.music || ""],
+                    albumName: s.album,
+                    albumArtURL: s.image ? s.image.replace("50x50", "500x500") : null,
+                    trackUrl: s.url,
+                    videoID: s.id,
+                    audioQuality: "KBPS320",
+                    audioFormat: "MP4"
+                  }
+                });
+              }
+            }
+          } catch (e) {
+            await writeLine({ event: "ProviderError", source_name: "SaavnProvider", message: e.message });
+          }
+        })());
+      }
+
+      // Task B: Audius (AudiusProvider - DOWNLOADABLE_PROVIDER with direct MP3 stream)
+      if (fullQuery) {
+        tasks.push((async () => {
+          try {
+            const audiusSearch = `https://discoveryprovider.audius.co/v1/tracks/search?query=${encodeURIComponent(fullQuery)}&app_name=Soundbound`;
+            const res = await fetch(audiusSearch);
+            if (res.ok) {
+              const json = await res.json();
+              const tracks = (json.data || []).slice(0, 5);
+              for (const t of tracks) {
+                const directStream = `https://discoveryprovider.audius.co/v1/tracks/${t.id}/stream?app_name=Soundbound`;
+                await writeLine({
+                  event: "TrackDetails",
+                  source_id: "in.shabinder.soundbound.extension.shabinder.audius",
+                  source_name: "AudiusProvider",
+                  source_type: "DOWNLOADABLE_PROVIDER",
+                  data: {
+                    title: t.title,
+                    artists: [t.user?.name || "Unknown"],
+                    durationSec: t.duration,
+                    albumArtURL: t.artwork?.["480x480"] || null,
+                    trackUrl: `https://audius.co${t.permalink || ""}`,
+                    videoID: t.id,
+                    downloaded: "NotDownloaded",
+                    DownloadQueryResult: {
+                      url: directStream,
+                      workerStreamUrl: `${url.origin}/stream?url=${encodeURIComponent(directStream)}`,
+                      audioFormat: "MP3",
+                      audioQuality: "KBPS320"
+                    }
+                  }
+                });
+              }
+            }
+          } catch (e) {
+            await writeLine({ event: "ProviderError", source_name: "AudiusProvider", message: e.message });
+          }
+        })());
+      }
+
+      // Task C: LrcLib (LrcLibProvider - PROVIDER / LYRICS_PROVIDER)
+      if (fullQuery) {
+        tasks.push((async () => {
+          try {
+            const lrcUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(fullQuery)}`;
+            const res = await fetch(lrcUrl, {
+              headers: { "User-Agent": "Soundbound-Worker/1.0" }
+            });
+            if (res.ok) {
+              const list = (await res.json()).slice(0, 5);
+              for (const item of list) {
+                await writeLine({
+                  event: "TrackDetails",
+                  source_id: "in.shabinder.soundbound.extension.shabinder.lrclib",
+                  source_name: "LrcLibProvider",
+                  source_type: "PROVIDER",
+                  data: {
+                    title: item.trackName,
+                    artists: [item.artistName],
+                    albumName: item.albumName,
+                    durationSec: Math.round(item.duration || 0),
+                    lyrics: item.syncedLyrics || item.plainLyrics || null
+                  }
+                });
+              }
+            }
+          } catch (e) {
+            await writeLine({ event: "ProviderError", source_name: "LrcLibProvider", message: e.message });
+          }
+        })());
+      }
+
+      // Task D: Deezer Public API (DeezerProvider - DOWNLOADABLE_PROVIDER / Preview Stream + Metadata)
+      if (fullQuery) {
+        tasks.push((async () => {
+          try {
+            const dzUrl = `https://api.deezer.com/search?q=${encodeURIComponent(fullQuery)}&limit=6`;
+            const res = await fetch(dzUrl);
+            if (res.ok) {
+              const json = await res.json();
+              for (const item of (json.data || [])) {
+                await writeLine({
+                  event: "TrackDetails",
+                  source_id: "in.shabinder.soundbound.extension.shabinder.deezer",
+                  source_name: "DeezerProvider",
+                  source_type: "DOWNLOADABLE_PROVIDER",
+                  data: {
+                    title: item.title,
+                    artists: [item.artist?.name || ""],
+                    albumName: item.album?.title || null,
+                    durationSec: item.duration,
+                    albumArtURL: item.album?.cover_big || null,
+                    trackUrl: item.link,
+                    videoID: String(item.id),
+                    DownloadQueryResult: item.preview ? {
+                      url: item.preview,
+                      workerStreamUrl: `${url.origin}/stream?url=${encodeURIComponent(item.preview)}`,
+                      audioFormat: "MP3",
+                      audioQuality: "KBPS128"
+                    } : null
+                  }
+                });
+              }
+            }
+          } catch (e) {
+            await writeLine({ event: "ProviderError", source_name: "DeezerProvider", message: e.message });
+          }
+        })());
+      }
+
+      // Task E: Odesli / Songlink (OdesliProvider - METADATA_PROVIDER for trackLink resolution)
+      if (queryParams.trackLink) {
+        tasks.push((async () => {
+          try {
+            const odesliUrl = `https://api.song.link/v1-alpha.1/links?url=${encodeURIComponent(queryParams.trackLink)}`;
+            const res = await fetch(odesliUrl);
+            if (res.ok) {
+              const data = await res.json();
+              await writeLine({
+                event: "MetadataResult",
+                source_id: "in.shabinder.soundbound.extension.shabinder.odesli",
+                source_name: "OdesliProvider",
+                source_type: "METADATA_PROVIDER",
+                data: {
+                  entityUniqueId: data.entityUniqueId,
+                  pageUrl: data.pageUrl,
+                  linksByPlatform: data.linksByPlatform,
+                  entitiesByUniqueId: data.entitiesByUniqueId
+                }
+              });
+            }
+          } catch (e) {
+            await writeLine({ event: "ProviderError", source_name: "OdesliProvider", message: e.message });
+          }
+        })());
+      }
+
+      await Promise.allSettled(tasks);
+      await writeLine({ event: "done", timestamp: Date.now() });
+    } catch (err) {
+      await writeLine({ event: "error", error: "ThrowableWrapper", message: err.message });
+    } finally {
+      await writer.close();
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      padding: 20px;
+  })());
+
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store"
     }
-    .container {
-      width: 100%;
-      max-width: 680px;
-      text-align: center;
-    }
-    h1 {
-      font-size: 2.5rem;
-      font-weight: 700;
-      margin-bottom: 8px;
-      background: linear-gradient(135deg, #60a5fa, #a855f7);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-    p { color: var(--text-muted); margin-bottom: 2rem; font-size: 1rem; }
-    .search-box {
-      display: flex;
-      background: var(--card);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 12px;
-      padding: 6px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-    }
-    input {
-      flex: 1;
-      background: transparent;
-      border: none;
-      outline: none;
-      color: #fff;
-      font-size: 1.1rem;
-      padding: 12px 16px;
-    }
-    button {
-      background: var(--accent);
-      color: #fff;
-      border: none;
-      outline: none;
-      border-radius: 8px;
-      padding: 12px 24px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity 0.2s;
-    }
-    button:hover { opacity: 0.9; }
-    .badges {
-      display: flex;
-      gap: 12px;
-      justify-content: center;
-      margin-top: 1.5rem;
-      flex-wrap: wrap;
-    }
-    .badge {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      padding: 6px 12px;
-      border-radius: 20px;
-      font-size: 0.85rem;
-      color: var(--text-muted);
-    }
-    .shortcuts {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-      gap: 12px;
-      margin-top: 2rem;
-    }
-    .shortcut-card {
-      background: var(--card);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      padding: 14px;
-      border-radius: 10px;
-      text-decoration: none;
-      color: var(--text);
-      font-weight: 500;
-      transition: transform 0.2s, border-color 0.2s;
-    }
-    .shortcut-card:hover {
-      transform: translateY(-2px);
-      border-color: var(--accent);
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Web Gateway</h1>
-    <p>Zero-Copy Stream Pipeline • Full CORS Bypass • Built-in Ad Shield</p>
-    <form class="search-box" onsubmit="go(event)">
-      <input type="text" id="target" placeholder="Enter full URL or search query..." autofocus required />
-      <button type="submit">Launch</button>
-    </form>
-    <div class="badges">
-      <span class="badge">⚡ Zero-Copy Range Streaming</span>
-      <span class="badge">🛡️ Ad & Tracker Shield</span>
-      <span class="badge">🌐 WebSocket & SSE Active</span>
-    </div>
-    <div class="shortcuts">
-      <a class="shortcut-card" href="/p/https://www.google.com">Google</a>
-      <a class="shortcut-card" href="/p/https://www.youtube.com">YouTube</a>
-      <a class="shortcut-card" href="/p/https://en.wikipedia.org">Wikipedia</a>
-      <a class="shortcut-card" href="/p/https://github.com">GitHub</a>
-    </div>
-  </div>
-  <script>
-    function go(e) {
-      e.preventDefault();
-      const val = document.getElementById('target').value.trim();
-      if (!val) return;
-      window.location.href = '/p/' + encodeURIComponent(val);
-    }
-  </script>
-</body>
-</html>`;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=UTF-8' }
   });
 }
