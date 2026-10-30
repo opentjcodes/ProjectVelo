@@ -1,14 +1,11 @@
-
-// --- START OF FILE worker.js (ProjectVelo v13.0.0) ---
-
 const WORKER_NAME = "ProjectVelo";
-const WORKER_VERSION = "13.0.0";
+const WORKER_VERSION = "10.0.0";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Range, If-Range, X-Custom-Headers, X-Custom-UA, X-Custom-Referer, X-Audio-Quality, X-Client-Id",
-  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, X-Worker-Engine, X-Upstream-Status, X-Upstream-Url, X-Cache-Status, X-Resolved-Bitrate, X-Audio-Quality, X-Audio-Source, X-Video-Resolution, X-Video-Codec, X-Video-Audio-Mode, X-Video-Id, X-Video-Sync-Offset-Ms, X-Lyrics-Source, X-Lyrics-Sync-Type, X-Home-Source, X-Reco-Source, X-Track-Title, X-Track-Artist, X-Track-Album, X-Track-Cover"
+  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, X-Worker-Engine, X-Upstream-Status, X-Upstream-Url, X-Cache-Status, X-Resolved-Bitrate, X-Audio-Quality, X-Lyrics-Source, X-Lyrics-Sync-Type, X-Home-Source, X-Reco-Source, X-Track-Title, X-Track-Artist, X-Track-Album, X-Track-Cover"
 };
 
 const SAAVN_API_BASE = "https://www.jiosaavn.com/api.php";
@@ -24,6 +21,7 @@ const SAAVN_HEADERS = {
   "Cookie": "L=english%2Chindi%2Cmalayalam%2Ctamil%2Ctelugu%2Cpunjabi%2Cbengali%2Ckannada; gdpr_acceptance=true; DL=english"
 };
 
+// Verified active 2026 LyricsPlus / KPOE / LRCMUX mirrors
 const LYRICSPLUS_MIRRORS = [
   "https://lyricsplus.prjktla.my.id",
   "https://lyricsplus.prjktla.workers.dev",
@@ -34,22 +32,7 @@ const LYRICSPLUS_MIRRORS = [
   "https://lyricsplus.atomix.one"
 ];
 
-const PIPED_API_INSTANCES = [
-  "https://pipedapi.kavin.rocks",
-  "https://api.piped.private.coffee",
-  "https://pipedapi.adminforge.de",
-  "https://pipedapi.smnz.de",
-  "https://pipedapi.drgns.space"
-];
-
-const INVIDIOUS_API_INSTANCES = [
-  "https://inv.nadeko.net",
-  "https://invidious.nerdvpn.de",
-  "https://yewtu.be",
-  "https://inv.tux.pizza",
-  "https://iv.melmac.space"
-];
-
+// Expanded Official Spotify Editorial & Chart Playlists for Rich Homepage & Regional Filtering
 const SPOTIFY_HOME_PLAYLISTS = {
   india_top: { id: "37i9dQZEVXbLZ52XmnySJg", title: "Top 50 — India", artist: "Muse Charts", lang: "all" },
   global_top: { id: "37i9dQZEVXbMDoHDwVN2tF", title: "Top 50 — Global", artist: "Muse Charts", lang: "english" },
@@ -69,8 +52,6 @@ const SPOTIFY_HOME_PLAYLISTS = {
 
 // Bounded In-Memory Caches for Sub-Millisecond Repeat Lookups & Reduced Subrequests
 const WORKING_STREAM_MEMO = new Map();
-const SECONDARY_AUDIO_MEMO = new Map();
-const VIDEO_STREAM_MEMO = new Map();
 const SONG_META_MEMO = new Map();
 const TRACK_IDENTITY_MEMO = new Map();
 const TRACK_BRIDGE_MEMO = new Map();
@@ -82,8 +63,6 @@ let CACHED_SPOTIFY_ANON_TOKEN = null;
 let CACHED_SPOTIFY_TOKEN_EXP = 0;
 let CACHED_APPLE_WEB_TOKEN = null;
 let CACHED_APPLE_TOKEN_EXP = 0;
-let CACHED_YT_VISITOR_DATA = null;
-let CACHED_YT_VISITOR_EXP = 0;
 
 function setBoundedMemo(map, key, value, maxEntries = 1500) {
   if (!key) return;
@@ -94,7 +73,7 @@ function setBoundedMemo(map, key, value, maxEntries = 1500) {
   map.set(key, value);
 }
 
-async function fetchWithTimeout(resource, options = {}, timeoutMs = 4200) {
+async function fetchWithTimeout(resource, options = {}, timeoutMs = 4800) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -102,6 +81,50 @@ async function fetchWithTimeout(resource, options = {}, timeoutMs = 4200) {
   } finally {
     clearTimeout(id);
   }
+}
+
+// ============================================================================
+// PERSISTENT 2-TIER SUBREQUEST REDUCTION CACHE (RAM + CLOUDFLARE EDGE)
+// ============================================================================
+
+async function getOrComputeSubrequestCache(cacheKeyStr, ttlSeconds, computeFn, ctx = null) {
+  if (TRACK_BRIDGE_MEMO.has(cacheKeyStr)) {
+    return TRACK_BRIDGE_MEMO.get(cacheKeyStr);
+  }
+
+  const cache = caches.default;
+  const syntheticReq = new Request(`https://edge-internal.projectvelo.workers.dev/kv/${encodeURIComponent(cacheKeyStr)}`, {
+    method: "GET"
+  });
+
+  try {
+    const hit = await cache.match(syntheticReq);
+    if (hit && hit.ok) {
+      const val = await hit.json();
+      setBoundedMemo(TRACK_BRIDGE_MEMO, cacheKeyStr, val, 2000);
+      return val;
+    }
+  } catch {}
+
+  const computed = await computeFn();
+  if (computed !== null && computed !== undefined) {
+    setBoundedMemo(TRACK_BRIDGE_MEMO, cacheKeyStr, computed, 2000);
+    try {
+      const resToStore = new Response(JSON.stringify(computed), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": `public, s-maxage=${ttlSeconds}`
+        }
+      });
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(cache.put(syntheticReq, resToStore));
+      } else {
+        await cache.put(syntheticReq, resToStore);
+      }
+    } catch {}
+  }
+  return computed;
 }
 
 // ============================================================================
@@ -125,7 +148,7 @@ function getOrCreateClientProfile(request, url) {
   if (!profile) {
     profile = {
       clientId: key,
-      preferredQuality: "320",
+      preferredQuality: "320", // Default to highest 320kbps resolution
       playedTrackIds: [],
       playedTrackSignatures: [],
       artistScores: {},
@@ -185,7 +208,6 @@ function recordClientTrackInteraction(request, url, trackObj) {
         id: idStr,
         spotifyId: trackObj.spotifyId || null,
         appleId: trackObj.appleId || null,
-        ytVideoId: trackObj.ytVideoId || null,
         title,
         artist: artistList[0] || artist
       },
@@ -202,6 +224,10 @@ function getTopClientAffinityArtists(profile, limit = 5) {
     .map(entry => entry[0]);
 }
 
+/**
+ * Resolves the requested audio quality tier.
+ * Always defaults to "320" (Highest Resolution 320kbps AAC/MP4).
+ */
 function resolveRequestedAudioQuality(request, url) {
   const rawParam = (
     url?.searchParams?.get("quality") ||
@@ -473,7 +499,6 @@ function upgradeImage(imgUrl) {
     .replace(/\{w\}x\{h\}([a-z]*)/gi, "600x600bb")
     .replace(/50x50|150x150/g, "500x500")
     .replace(/100x100bb|60x60bb|200x200bb|300x300bb/g, "600x600bb")
-    .replace(/=w\d+-h\d+[^&?]*/gi, "=w600-h600-l90-rj")
     .replace(/^http:\/\//i, "https://");
 }
 
@@ -482,7 +507,7 @@ function proxyImg(imgUrl, origin) {
   return hi ? `${origin}/stream?url=${encodeURIComponent(hi)}` : "";
 }
 
-async function fetchSaavnJson(queryParamsObj, timeoutMs = 4200) {
+async function fetchSaavnJson(queryParamsObj, timeoutMs = 5000) {
   const qs = new URLSearchParams({
     _format: "json",
     _marker: "0",
@@ -609,25 +634,15 @@ function transliterateIndicToRoman(input) {
 }
 
 // ============================================================================
-// PHONETIC & ARABIZI STRING SIMILARITY, VARIANT DETECTION & DEDUPLICATION
+// STRING SIMILARITY, VARIANT DETECTION & SMART DEDUPLICATION ENGINE
 // ============================================================================
 
 function normalizeTokenComparison(str) {
   return String(str || "")
     .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/(?<=[a-z])3(?=[a-z])/g, "a")
-    .replace(/(?<=[a-z])7(?=[a-z])/g, "h")
-    .replace(/(?<=[a-z])2(?=[a-z])/g, "a")
-    .replace(/aa+/g, "a")
-    .replace(/ee+/g, "i")
-    .replace(/oo+/g, "u")
-    .replace(/ll+/g, "l")
-    .replace(/mm+/g, "m")
-    .replace(/nn+/g, "n")
-    .replace(/ss+/g, "s")
-    .replace(/tt+/g, "t")
+    .replace(/aa/g, "a")
+    .replace(/ee/g, "i")
+    .replace(/oo/g, "u")
     .replace(/sh/g, "s")
     .replace(/zh/g, "l")
     .replace(/kh/g, "k")
@@ -635,15 +650,15 @@ function normalizeTokenComparison(str) {
     .replace(/dh/g, "d")
     .replace(/th/g, "t")
     .replace(/ph/g, "f")
-    .replace(/[^a-z0-9\u0600-\u06ff\u0900-\u0d7f\u4e00-\u9fff]+/g, " ")
+    .replace(/[^a-z0-9\u0900-\u0d7f\u4e00-\u9fff]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function computeConsonantSkeleton(str) {
-  return normalizeTokenComparison(str).replace(/[aeiou\s]+/g, "");
-}
-
+/**
+ * Computes Sorensen-Dice bigram similarity + token overlap (0.0 to 1.0)
+ * for accurate fuzzy matching across JioSaavn, Apple Music, Spotify, and LRCLIB.
+ */
 function computeStringSimilarity(strA, strB) {
   const a = normalizeTokenComparison(strA);
   const b = normalizeTokenComparison(strB);
@@ -651,13 +666,7 @@ function computeStringSimilarity(strA, strB) {
   if (a === b) return 1.0;
   if (a.includes(b) || b.includes(a)) {
     const ratio = Math.min(a.length, b.length) / Math.max(a.length, b.length);
-    return Math.max(0.84, ratio);
-  }
-
-  const skelA = computeConsonantSkeleton(a);
-  const skelB = computeConsonantSkeleton(b);
-  if (skelA.length >= 4 && skelA === skelB) {
-    return 0.92;
+    return Math.max(0.82, ratio);
   }
 
   const aCompact = a.replace(/\s+/g, "");
@@ -694,7 +703,6 @@ function extractTrackVariantTag(rawTitle = "", rawAlbum = "") {
     { key: "unplugged", rx: /\b(unplugged|acoustic|stripped|piano\s+version|guitar\s+version|mtv\s+unplugged)\b/i },
     { key: "live", rx: /\b(live|concert\s+version|session)\b/i },
     { key: "reprise", rx: /\b(reprise|reprised|encore|reload|reloaded|version\s*2|part\s*2|pt\.?\s*2)\b/i },
-    { key: "cover", rx: /\b(cover|cover\s+version|fan\s*made|tribute|rendition)\b/i },
     { key: "female", rx: /\b(female\s+version|female\s+vocals?)\b/i },
     { key: "male", rx: /\b(male\s+version|male\s+vocals?)\b/i },
     { key: "duet", rx: /\b(duet\s+version)\b/i },
@@ -721,7 +729,7 @@ function extractCoreTrackTitle(rawTitle = "") {
   return cleanText(rawTitle)
     .replace(/\s*[\[(]\s*(?:from|movie|film|ost|original\s+motion\s+picture|soundtrack|motion\s+picture|featured\s+in|inspired\s+by|theme)[^)\]]*[\])]/gi, " ")
     .replace(/\s*-\s*(?:from|movie|film|ost|original\s+motion\s+picture|single|ep|soundtrack).*$/gi, " ")
-    .replace(/\s*[\[(]\s*(?:official[^)\]]*|audio[^)\]]*|video[^)\]]*|music\s+video[^)\]]*|mv|m\/v|visualizer[^)\]]*|lyrical[^)\]]*|lyric[^)\]]*|full\s+song[^)\]]*|full\s+video[^)\]]*|4k[^)\]]*|hd|hq|hindi|tamil|telugu|malayalam|kannada|punjabi|bengali|english|arabic|exclusive[^)\]]*|feat\.?[^)\]]*|ft\.?[^)\]]*)\s*[\])]/gi, " ")
+    .replace(/\s*[\[(]\s*(?:official|audio|video|lyrical|full\s+song|full\s+video|hd|hq|hindi|tamil|telugu|malayalam|kannada|punjabi|bengali|english|feat\.?[^)\]]*|ft\.?[^)\]]*)\s*[\])]/gi, " ")
     .replace(/\s*[\[(][^)\]]*(?:remix|lo-?fi|slowed|reverb|unplugged|acoustic|live|reprise|reprised|encore|mix|flip|mashup|version|edit)[^)\]]*[\])]/gi, " ")
     .replace(/\s*-\s*[^-]*(?:remix|lo-?fi|slowed|reverb|unplugged|acoustic|live|reprise|reprised|encore|mix|flip|mashup|version|edit).*$/gi, " ")
     .replace(/\b(?:feat\.?|ft\.?|featuring)\s+.*$/gi, " ")
@@ -779,8 +787,7 @@ function isLowQualityJunkTrack(rawSong, userQuery = "") {
     /\btribute\s+to\b/i,
     /\boriginally\s+performed\s+by\b/i,
     /\bdialogue\s+promo\b/i,
-    /\binstrumental\s+ringtone\b/i,
-    /\bfan\s*made\b/i
+    /\binstrumental\s+ringtone\b/i
   ];
   for (const rx of junkPatterns) {
     if ((rx.test(title) || rx.test(album)) && !rx.test(q)) {
@@ -799,7 +806,6 @@ async function batchHealMissingMediaUrls(rawSongs) {
       s.id &&
       !String(s.id).startsWith("apple:") &&
       !String(s.id).startsWith("spotify:") &&
-      !String(s.id).startsWith("ytm:") &&
       !String(s.id).startsWith("curated:") &&
       !(s.more_info?.encrypted_media_url || s.encrypted_media_url || s.decrypted_media_url)
     )
@@ -808,13 +814,13 @@ async function batchHealMissingMediaUrls(rawSongs) {
   if (missingIds.length === 0) return rawSongs;
 
   const healedMap = {};
-  for (let i = 0; i < Math.min(missingIds.length, 40); i += 20) {
+  for (let i = 0; i < missingIds.length; i += 20) {
     const chunk = missingIds.slice(i, i + 20);
     try {
       const batchData = await fetchSaavnJson({
         __call: "song.getDetails",
         pids: chunk.join(",")
-      }, 3200);
+      });
       const list = Array.isArray(batchData?.songs)
         ? batchData.songs
         : Object.values(batchData || {}).filter(x => x && typeof x === "object" && x.id);
@@ -911,6 +917,7 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
   const uniqueArtists = [...new Set(artistNames.filter(a => a && a.toLowerCase() !== "unknown"))];
   const primaryArtists = uniqueArtists.slice(0, 4).join(", ") || cleanText(s.subtitle || "Unknown Artist");
 
+  // Prefer JioSaavn's own song artwork if externalMeta's artwork is a generic Spotify playlist banner (ab67706)
   const extImg = externalMeta?.artworkUrl || "";
   const isGenericPlaylistCover = /ab67706/i.test(extImg);
   const rawImg = (!isGenericPlaylistCover && extImg) ? extImg : (s.image || s.coverUrl || extImg);
@@ -920,11 +927,8 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
   const albumTitle = cleanText(externalMeta?.collectionName || more.album || s.album || "OpenMuse");
   const albumId = more.album_id || s.album_id || null;
   const durationSec = parseInt(more.duration || s.duration || externalMeta?.durationSec || "0", 10) || 0;
-  const playCount = parseInt(s.play_count || more.play_count || externalMeta?.playCount || "0", 10) || 0;
   const appleId = externalMeta?.appleTrackId || s.appleId || null;
   const spotifyId = externalMeta?.spotifyTrackId || s.spotifyId || null;
-  const ytVideoId = externalMeta?.ytVideoId || s.ytVideoId || null;
-  const canonicalRank = externalMeta?.canonicalRank ?? s.canonicalRank ?? null;
   const idStr = String(s.id);
   const variantTag = extractTrackVariantTag(titleClean, albumTitle);
 
@@ -933,15 +937,11 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
 
   const workerStream = selectedDirectUrl
     ? `${origin}/stream?url=${encodeURIComponent(selectedDirectUrl)}&quality=${quality}`
-    : `${origin}/play?id=${encodeURIComponent(idStr)}${appleId ? `&appleId=${encodeURIComponent(appleId)}` : ""}${spotifyId ? `&spotifyId=${encodeURIComponent(spotifyId)}` : ""}${ytVideoId ? `&ytVideoId=${encodeURIComponent(ytVideoId)}` : ""}&title=${encodeURIComponent(titleClean)}&artist=${encodeURIComponent(primaryArtists)}&album=${encodeURIComponent(albumTitle)}&duration=${durationSec}&quality=${quality}`;
+    : `${origin}/play?id=${encodeURIComponent(idStr)}${appleId ? `&appleId=${encodeURIComponent(appleId)}` : ""}${spotifyId ? `&spotifyId=${encodeURIComponent(spotifyId)}` : ""}&title=${encodeURIComponent(titleClean)}&artist=${encodeURIComponent(primaryArtists)}&album=${encodeURIComponent(albumTitle)}&duration=${durationSec}&quality=${quality}`;
 
-  const playEndpointUrl = `${origin}/play?id=${encodeURIComponent(idStr)}${appleId ? `&appleId=${encodeURIComponent(appleId)}` : ""}${spotifyId ? `&spotifyId=${encodeURIComponent(spotifyId)}` : ""}${ytVideoId ? `&ytVideoId=${encodeURIComponent(ytVideoId)}` : ""}${selectedDirectUrl ? `&url=${encodeURIComponent(selectedDirectUrl)}` : ""}&title=${encodeURIComponent(titleClean)}&artist=${encodeURIComponent(primaryArtists)}&album=${encodeURIComponent(albumTitle)}&duration=${durationSec}&quality=${quality}`;
+  const playEndpointUrl = `${origin}/play?id=${encodeURIComponent(idStr)}${appleId ? `&appleId=${encodeURIComponent(appleId)}` : ""}${spotifyId ? `&spotifyId=${encodeURIComponent(spotifyId)}` : ""}${selectedDirectUrl ? `&url=${encodeURIComponent(selectedDirectUrl)}` : ""}&title=${encodeURIComponent(titleClean)}&artist=${encodeURIComponent(primaryArtists)}&album=${encodeURIComponent(albumTitle)}&duration=${durationSec}&quality=${quality}`;
   const downloadEndpointUrl = `${origin}/download?id=${encodeURIComponent(idStr)}${selectedDirectUrl ? `&url=${encodeURIComponent(selectedDirectUrl)}` : ""}&title=${encodeURIComponent(titleClean)}&artist=${encodeURIComponent(primaryArtists)}&album=${encodeURIComponent(albumTitle)}&quality=${quality}`;
   const lyricsEndpointUrl = `${origin}/lyrics?id=${encodeURIComponent(idStr)}${appleId ? `&appleId=${encodeURIComponent(appleId)}` : ""}${spotifyId ? `&spotifyId=${encodeURIComponent(spotifyId)}` : ""}&trackName=${encodeURIComponent(titleClean)}&artistName=${encodeURIComponent(primaryArtists)}&albumName=${encodeURIComponent(albumTitle)}&duration=${durationSec}`;
-
-  const baseVideoQuery = `id=${encodeURIComponent(idStr)}${ytVideoId ? `&videoId=${encodeURIComponent(ytVideoId)}` : ""}&title=${encodeURIComponent(titleClean)}&artist=${encodeURIComponent(primaryArtists)}&album=${encodeURIComponent(albumTitle)}&duration=${durationSec}`;
-  const videoStreamEndpointUrl = `${origin}/video?${baseVideoQuery}&mode=stream`;
-  const videoMetaEndpointUrl = `${origin}/video?${baseVideoQuery}&mode=json`;
 
   const cascade = selectedDirectUrl ? buildSaavnBitrateCascade(selectedDirectUrl, quality) : [];
 
@@ -963,9 +963,6 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
     id: idStr,
     appleId: appleId ? String(appleId) : null,
     spotifyId: spotifyId ? String(spotifyId) : null,
-    ytVideoId: ytVideoId ? String(ytVideoId) : null,
-    canonicalRank,
-    play_count: playCount,
     variant: variantTag,
     type: "song",
     itemType: "song",
@@ -980,7 +977,6 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
     duration: durationSec,
     language: cleanText(s.language || more.language || ""),
     hasLyrics: true,
-    hasVideo: true,
     image: hiResImg,
     coverUrl: proxyImg(hiResImg, origin),
     encrypted_media_url: enc || "",
@@ -989,16 +985,12 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
     playUrl: playEndpointUrl,
     downloadUrl: downloadEndpointUrl,
     lyricsUrl: lyricsEndpointUrl,
-    videoUrl: videoStreamEndpointUrl,
-    videoStreamUrl: videoStreamEndpointUrl,
-    videoMetaUrl: videoMetaEndpointUrl,
     audioQuality: `${quality}kbps`,
     qualities: qualitiesObj,
     more_info: {
       ...more,
       encrypted_media_url: enc || "",
       "320kbps": "true",
-      play_count: String(playCount),
       album: albumTitle,
       album_id: albumId ? String(albumId) : null,
       primary_artists: primaryArtists,
@@ -1009,8 +1001,6 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
       workerStreamUrl: workerStream,
       smartPlayUrl: playEndpointUrl,
       downloadUrl: downloadEndpointUrl,
-      videoStreamUrl: videoStreamEndpointUrl,
-      videoMetaUrl: videoMetaEndpointUrl,
       audioFormat: "MP4_AAC_LC",
       audioQuality: `KBPS${quality}`,
       qualities: qualitiesObj,
@@ -1021,7 +1011,6 @@ function enrichSaavnSong(s, origin, externalMeta = null, preferredQuality = "320
   setBoundedMemo(SONG_META_MEMO, idStr, enrichedObj);
   if (appleId) setBoundedMemo(SONG_META_MEMO, `apple:${appleId}`, enrichedObj);
   if (spotifyId) setBoundedMemo(SONG_META_MEMO, `spotify:${spotifyId}`, enrichedObj);
-  if (ytVideoId) setBoundedMemo(SONG_META_MEMO, `ytm:${ytVideoId}`, enrichedObj);
   return enrichedObj;
 }
 
@@ -1029,9 +1018,6 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
   const quality = ["320", "160", "96"].includes(String(preferredQuality)) ? String(preferredQuality) : "320";
   const appleTrackId = curatedItem.trackId || curatedItem.appleId ? String(curatedItem.trackId || curatedItem.appleId) : "";
   const spotifyTrackId = curatedItem.spotifyId ? String(curatedItem.spotifyId) : "";
-  const ytVideoId = curatedItem.ytVideoId ? String(curatedItem.ytVideoId) : "";
-  const canonicalRank = curatedItem.canonicalRank ?? null;
-  const playCount = Number(curatedItem.playCount || curatedItem.views || 0);
   const trackName = cleanText(curatedItem.trackName || curatedItem.name || curatedItem.title || "Untitled");
   const artistName = cleanText(curatedItem.artistName || curatedItem.artist || "Unknown Artist");
   const collectionName = cleanText(curatedItem.collectionName || curatedItem.albumName || trackName);
@@ -1046,9 +1032,6 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
     return enrichSaavnSong(matchedSaavnRaw, origin, {
       appleTrackId: appleTrackId || null,
       spotifyTrackId: spotifyTrackId || null,
-      ytVideoId: ytVideoId || null,
-      canonicalRank,
-      playCount,
       trackName: matchedSaavnRaw.title && extractTrackVariantTag(matchedSaavnRaw.title) !== "standard"
         ? cleanText(matchedSaavnRaw.title)
         : trackName,
@@ -1061,18 +1044,12 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
 
   const syntheticId = appleTrackId
     ? `apple:${appleTrackId}`
-    : (spotifyTrackId
-        ? `spotify:${spotifyTrackId}`
-        : (ytVideoId ? `ytm:${ytVideoId}` : `curated:${encodeURIComponent(`${trackName}_${artistName}`)}`));
+    : (spotifyTrackId ? `spotify:${spotifyTrackId}` : `curated:${encodeURIComponent(`${trackName}_${artistName}`)}`);
 
-  const basePlayParams = `id=${encodeURIComponent(syntheticId)}${appleTrackId ? `&appleId=${encodeURIComponent(appleTrackId)}` : ""}${spotifyTrackId ? `&spotifyId=${encodeURIComponent(spotifyTrackId)}` : ""}${ytVideoId ? `&ytVideoId=${encodeURIComponent(ytVideoId)}` : ""}&title=${encodeURIComponent(trackName)}&artist=${encodeURIComponent(artistName)}&album=${encodeURIComponent(collectionName)}&duration=${durationSec}`;
+  const basePlayParams = `id=${encodeURIComponent(syntheticId)}${appleTrackId ? `&appleId=${encodeURIComponent(appleTrackId)}` : ""}${spotifyTrackId ? `&spotifyId=${encodeURIComponent(spotifyTrackId)}` : ""}&title=${encodeURIComponent(trackName)}&artist=${encodeURIComponent(artistName)}&album=${encodeURIComponent(collectionName)}&duration=${durationSec}`;
   const playEndpointUrl = `${origin}/play?${basePlayParams}&quality=${quality}`;
   const downloadEndpointUrl = `${origin}/download?${basePlayParams}&quality=${quality}`;
   const lyricsEndpointUrl = `${origin}/lyrics?id=${encodeURIComponent(syntheticId)}${appleTrackId ? `&appleId=${encodeURIComponent(appleTrackId)}` : ""}${spotifyTrackId ? `&spotifyId=${encodeURIComponent(spotifyTrackId)}` : ""}&trackName=${encodeURIComponent(trackName)}&artistName=${encodeURIComponent(artistName)}&albumName=${encodeURIComponent(collectionName)}&duration=${durationSec}`;
-
-  const baseVideoQuery = `id=${encodeURIComponent(syntheticId)}${ytVideoId ? `&videoId=${encodeURIComponent(ytVideoId)}` : ""}&title=${encodeURIComponent(trackName)}&artist=${encodeURIComponent(artistName)}&album=${encodeURIComponent(collectionName)}&duration=${durationSec}`;
-  const videoStreamEndpointUrl = `${origin}/video?${baseVideoQuery}&mode=stream`;
-  const videoMetaEndpointUrl = `${origin}/video?${baseVideoQuery}&mode=json`;
 
   const qualitiesObj = {
     default: `${quality}kbps`,
@@ -1091,9 +1068,6 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
     id: syntheticId,
     appleId: appleTrackId || null,
     spotifyId: spotifyTrackId || null,
-    ytVideoId: ytVideoId || null,
-    canonicalRank,
-    play_count: playCount,
     variant: extractTrackVariantTag(trackName, collectionName),
     type: "song",
     itemType: "song",
@@ -1107,7 +1081,6 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
     albumId: curatedItem.collectionId ? `apple:${curatedItem.collectionId}` : null,
     duration: durationSec,
     hasLyrics: true,
-    hasVideo: true,
     image: artworkUrl,
     coverUrl: proxyImg(artworkUrl, origin),
     encrypted_media_url: "",
@@ -1116,15 +1089,11 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
     playUrl: playEndpointUrl,
     downloadUrl: downloadEndpointUrl,
     lyricsUrl: lyricsEndpointUrl,
-    videoUrl: videoStreamEndpointUrl,
-    videoStreamUrl: videoStreamEndpointUrl,
-    videoMetaUrl: videoMetaEndpointUrl,
     audioQuality: `${quality}kbps`,
     qualities: qualitiesObj,
     more_info: {
       encrypted_media_url: "",
       "320kbps": "true",
-      play_count: String(playCount),
       album: collectionName,
       primary_artists: artistName,
       duration: String(durationSec)
@@ -1134,8 +1103,6 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
       workerStreamUrl: playEndpointUrl,
       smartPlayUrl: playEndpointUrl,
       downloadUrl: downloadEndpointUrl,
-      videoStreamUrl: videoStreamEndpointUrl,
-      videoMetaUrl: videoMetaEndpointUrl,
       audioFormat: "MP4_AAC_LC",
       audioQuality: `KBPS${quality}`,
       qualities: qualitiesObj,
@@ -1144,7 +1111,6 @@ function buildCuratedBridgedSongObject(curatedItem, matchedSaavnRaw, origin, pre
   };
 
   setBoundedMemo(SONG_META_MEMO, syntheticId, bridgedObj);
-  if (ytVideoId) setBoundedMemo(SONG_META_MEMO, `ytm:${ytVideoId}`, bridgedObj);
   return bridgedObj;
 }
 
@@ -1158,7 +1124,7 @@ function findBestSaavnMatchForCuratedTrack(curatedItem, saavnPool) {
   const targetArtists = String(curatedItem.artistName || curatedItem.artist || "")
     .split(/[,&/|]/)
     .map(a => normalizeTokenComparison(a))
-    .filter(a => a && !/^(unknown|artist|various|spotify|apple|muse|openmuse|youtube)$/i.test(a));
+    .filter(Boolean);
   const targetDur = curatedItem.trackTimeMillis
     ? Math.round(curatedItem.trackTimeMillis / 1000)
     : (curatedItem.durationSec || 0);
@@ -1180,14 +1146,14 @@ function findBestSaavnMatchForCuratedTrack(curatedItem, saavnPool) {
     const titleSim = computeStringSimilarity(sCore, targetCore);
     if (sCore === targetCore) {
       score += 110;
-    } else if (titleSim >= 0.85) {
+    } else if (titleSim >= 0.84) {
       score += Math.round(titleSim * 95);
-    } else if ((sCore.includes(targetCore) || targetCore.includes(sCore)) && Math.min(sCore.length, targetCore.length) >= 5) {
+    } else if (sCore.includes(targetCore) || targetCore.includes(sCore)) {
       score += 78;
     } else {
       const aWords = targetCore.split(" ").filter(w => w.length >= 3);
       const matched = aWords.filter(w => sCore.includes(w));
-      if (aWords.length >= 2 && matched.length === aWords.length) {
+      if (aWords.length > 0 && matched.length === aWords.length) {
         score += 72;
       } else {
         continue;
@@ -1206,53 +1172,25 @@ function findBestSaavnMatchForCuratedTrack(curatedItem, saavnPool) {
 
     let artistMatched = false;
     for (const aa of targetArtists) {
-      const significantWords = aa.split(" ").filter(w => w.length >= 3);
-      if (
-        sArtistStr.includes(aa) ||
-        (significantWords.length > 0 && significantWords.every(w => sArtistStr.includes(w))) ||
-        significantWords.some(w => w.length >= 5 && sArtistStr.includes(w))
-      ) {
-        score += 80;
+      const firstWord = aa.split(" ").find(w => w.length >= 3);
+      if (sArtistStr.includes(aa) || (firstWord && firstWord.length >= 4 && sArtistStr.includes(firstWord))) {
+        score += 70;
         artistMatched = true;
         break;
       }
     }
 
-    const sAlbumNorm = normalizeTokenComparison(sAlbumRaw);
-    const targetAlbNorm = normalizeTokenComparison(targetAlbumRaw);
-    const albumMatched = Boolean(
-      targetAlbNorm &&
-      sAlbumNorm &&
-      targetAlbNorm !== targetCore &&
-      (sAlbumNorm.includes(targetAlbNorm) || targetAlbNorm.includes(sAlbumNorm))
-    );
-    if (albumMatched) score += 45;
-
     const sDur = parseInt(s.more_info?.duration || s.duration || "0", 10) || 0;
     if (targetDur > 0 && sDur > 0) {
       const diff = Math.abs(targetDur - sDur);
-      if (diff <= 4) {
-        score += 65;
-      } else if (diff <= 10) {
-        score += 38;
-      } else if (diff <= 20) {
-        score += 12;
-      } else if (diff > 32) {
-        score -= 80;
-      }
+      if (diff <= 4) score += 65;
+      else if (diff <= 10) score += 40;
+      else if (diff <= 20) score += 15;
+      else if (diff > 38 && !artistMatched) score -= 55;
     }
-
-    if (targetArtists.length > 0 && !artistMatched && !albumMatched) {
-      score -= 110;
-    }
-
-    const playCount = parseInt(s.play_count || s.more_info?.play_count || "0", 10) || 0;
-    if (playCount > 1_000_000) score += 25;
-    else if (playCount > 100_000) score += 12;
-    else if (playCount > 0 && playCount < 1000 && !artistMatched) score -= 40;
 
     if (s.more_info?.encrypted_media_url || s.encrypted_media_url) {
-      score += 15;
+      score += 20;
     }
 
     if (score > bestScore) {
@@ -1261,7 +1199,7 @@ function findBestSaavnMatchForCuratedTrack(curatedItem, saavnPool) {
     }
   }
 
-  return bestScore >= 145 ? bestMatch : null;
+  return bestScore >= 95 ? bestMatch : null;
 }
 
 function enrichSaavnAlbum(a, origin) {
@@ -1295,1454 +1233,13 @@ function enrichSaavnAlbum(a, origin) {
 }
 
 // ============================================================================
-// DIRECT YOUTUBE & YOUTUBE MUSIC INNERTUBE + MULTI-TIER VIDEO & AUDIO ENGINE
-// (100% RELIABLE STREAMING, ZERO CORS, ZERO 403, AUDIO-VIDEO SYNC READY)
-// ============================================================================
-
-function extractYoutubeVideoId(urlOrId) {
-  if (!urlOrId) return "";
-  const str = String(urlOrId).trim();
-  if (/^[A-Za-z0-9_-]{11}$/.test(str)) return str;
-  const match = str.match(/(?:v=|\/videos\/|embed\/|youtu\.be\/|\/v\/|watch\?.*v=)([A-Za-z0-9_-]{11})/);
-  return match ? match[1] : "";
-}
-
-function parseDurationTextToSec(durText) {
-  if (!durText) return 0;
-  const parts = String(durText).trim().split(":").map(Number);
-  if (parts.some(isNaN)) return 0;
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
-}
-
-function parseViewCountText(viewText) {
-  if (!viewText) return 0;
-  const s = String(viewText).toUpperCase();
-  const numMatch = s.match(/([0-9]+(?:\.[0-9]+)?)\s*([KMB])?/);
-  if (!numMatch) return 0;
-  const val = parseFloat(numMatch[1]);
-  const mult = numMatch[2] === "B" ? 1_000_000_000 : (numMatch[2] === "M" ? 1_000_000 : (numMatch[2] === "K" ? 1_000 : 1));
-  if (mult > 1) return Math.round(val * mult);
-  const digits = String(viewText).replace(/[^0-9]/g, "");
-  return parseInt(digits || "0", 10) || 0;
-}
-
-/**
- * Queries YouTube Music (`WEB_REMIX` — `music.youtube.com/youtubei/v1/search`) directly!
- * Returns structured official songs (`ATV`) and official music videos (`OMV`) with exact metadata.
- */
-async function searchYouTubeMusicDirectInnertube(query, timeoutMs = 2800) {
-  if (!query) return [];
-  try {
-    const res = await fetchWithTimeout(
-      "https://music.youtube.com/youtubei/v1/search?prettyPrint=false",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": SAAVN_HEADERS["User-Agent"],
-          "Origin": "https://music.youtube.com",
-          "Referer": "https://music.youtube.com/"
-        },
-        body: JSON.stringify({
-          context: {
-            client: {
-              clientName: "WEB_REMIX",
-              clientVersion: "1.20250310.01.00",
-              hl: "en",
-              gl: "IN",
-              ...(CACHED_YT_VISITOR_DATA && Date.now() < CACHED_YT_VISITOR_EXP ? { visitorData: CACHED_YT_VISITOR_DATA } : {})
-            }
-          },
-          query
-        })
-      },
-      timeoutMs
-    );
-    if (!res.ok) return [];
-    const data = await res.json();
-
-    if (data?.responseContext?.visitorData) {
-      CACHED_YT_VISITOR_DATA = data.responseContext.visitorData;
-      CACHED_YT_VISITOR_EXP = Date.now() + 30 * 60 * 1000;
-    }
-
-    const results = [];
-    const seenIds = new Set();
-
-    const extractFromItemRenderer = (mrlir) => {
-      if (!mrlir) return;
-      const videoId = mrlir?.playlistItemData?.videoId
-        || mrlir?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId;
-      if (!videoId || seenIds.has(videoId)) return;
-
-      const watchCfg = mrlir?.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.watchEndpointMusicSupportedConfigs?.watchEndpointMusicConfig;
-      const musicVideoType = watchCfg?.musicVideoType || "";
-
-      const flexCols = Array.isArray(mrlir.flexColumns) ? mrlir.flexColumns : [];
-      const titleRuns = flexCols[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-      const metaRuns = flexCols[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
-
-      const title = titleRuns.map(r => r.text).join("").trim();
-      if (!title) return;
-
-      const metaTexts = metaRuns.map(r => r.text).filter(t => t && !/^\s*[•·|,]\s*$/.test(t));
-      let itemKind = (metaTexts[0] || "").toLowerCase();
-      let uploaderName = "";
-      let duration = 0;
-      let views = 0;
-
-      for (const mt of metaTexts) {
-        if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(mt.trim())) {
-          duration = parseDurationTextToSec(mt.trim());
-        } else if (/\bviews?\b|\bplays?\b/i.test(mt)) {
-          views = parseViewCountText(mt);
-        } else if (!/^(song|video|episode|single|album|artist|playlist)$/i.test(mt.trim()) && !uploaderName) {
-          uploaderName = mt.trim();
-        }
-      }
-
-      const thumbs = mrlir?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
-      const thumbUrl = thumbs.length > 0
-        ? upgradeImage(thumbs[thumbs.length - 1].url)
-        : `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-
-      seenIds.add(videoId);
-      results.push({
-        videoId,
-        title: cleanText(title),
-        uploaderName: cleanText(uploaderName || "YouTube Music"),
-        uploaderVerified: true,
-        duration,
-        views: views || 2_500_000,
-        thumbnail: thumbUrl,
-        isShort: Boolean(duration > 0 && duration < 45),
-        musicVideoType,
-        isOfficialMusicVideo: musicVideoType === "MUSIC_VIDEO_TYPE_OMV" || itemKind === "video"
-      });
-    };
-
-    const tabs = data?.contents?.tabbedSearchResultsRenderer?.tabs || [];
-    for (const tab of tabs) {
-      const sections = tab?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-      for (const sec of sections) {
-        const card = sec?.musicCardShelfRenderer;
-        if (card) {
-          const cardVid = card?.title?.runs?.[0]?.navigationEndpoint?.watchEndpoint?.videoId;
-          const cardTitle = (card?.title?.runs || []).map(r => r.text).join("");
-          const subRuns = (card?.subtitle?.runs || []).map(r => r.text).filter(t => t && !/^\s*[•·|]\s*$/.test(t));
-          if (cardVid && cardTitle && !seenIds.has(cardVid)) {
-            seenIds.add(cardVid);
-            const durText = subRuns.find(t => /^\d{1,2}:\d{2}$/.test(t.trim())) || "";
-            results.push({
-              videoId: cardVid,
-              title: cleanText(cardTitle),
-              uploaderName: cleanText(subRuns[1] || subRuns[0] || "Artist"),
-              uploaderVerified: true,
-              duration: parseDurationTextToSec(durText),
-              views: 5_000_000,
-              thumbnail: `https://i.ytimg.com/vi/${cardVid}/maxresdefault.jpg`,
-              isShort: false,
-              musicVideoType: "MUSIC_VIDEO_TYPE_OMV",
-              isOfficialMusicVideo: true
-            });
-          }
-        }
-
-        const shelfItems = sec?.musicShelfRenderer?.contents || [];
-        for (const it of shelfItems) {
-          extractFromItemRenderer(it?.musicResponsiveListItemRenderer);
-        }
-      }
-    }
-
-    return results;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Direct YouTube Web Innertube Search (`searchYouTubeDirectInnertube`)
- * Fixed in v13: No URL-encoded `%3D%3D` inside JSON body! Caches `visitorData` automatically.
- */
-async function searchYouTubeDirectInnertube(query, timeoutMs = 3000) {
-  if (!query) return [];
-  try {
-    const res = await fetchWithTimeout(
-      "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": SAAVN_HEADERS["User-Agent"],
-          "Accept-Language": "en-US,en;q=0.9",
-          "Origin": "https://www.youtube.com",
-          "Referer": "https://www.youtube.com/"
-        },
-        body: JSON.stringify({
-          context: {
-            client: {
-              clientName: "WEB",
-              clientVersion: "2.20250312.04.00",
-              hl: "en",
-              gl: "IN",
-              ...(CACHED_YT_VISITOR_DATA && Date.now() < CACHED_YT_VISITOR_EXP ? { visitorData: CACHED_YT_VISITOR_DATA } : {})
-            }
-          },
-          query,
-          params: "EgIQAQ==" // Unencoded valid base64 for "Videos only"
-        })
-      },
-      timeoutMs
-    );
-    if (!res.ok) return [];
-    const data = await res.json();
-
-    if (data?.responseContext?.visitorData) {
-      CACHED_YT_VISITOR_DATA = data.responseContext.visitorData;
-      CACHED_YT_VISITOR_EXP = Date.now() + 30 * 60 * 1000;
-    }
-
-    const sections = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
-    const results = [];
-
-    for (const sec of sections) {
-      const items = sec?.itemSectionRenderer?.contents || [];
-      for (const item of items) {
-        const vr = item?.videoRenderer;
-        if (!vr || !vr.videoId) continue;
-
-        const title = (vr.title?.runs || []).map(r => r.text).join("") || vr.title?.simpleText || "";
-        const uploaderName = (vr.ownerText?.runs || []).map(r => r.text).join("") || vr.longBylineText?.runs?.[0]?.text || "";
-        const badges = vr.ownerBadges || [];
-        const uploaderVerified = badges.some(b =>
-          String(b?.metadataBadgeRenderer?.style || "").includes("VERIFIED") ||
-          String(b?.metadataBadgeRenderer?.style || "").includes("OFFICIAL_ARTIST")
-        );
-        const durText = vr.lengthText?.simpleText || "";
-        const duration = parseDurationTextToSec(durText);
-        const viewText = vr.viewCountText?.simpleText || vr.shortViewCountText?.simpleText || "";
-        const views = parseViewCountText(viewText);
-        const thumbs = vr.thumbnail?.thumbnails || [];
-        const thumbnail = thumbs.length > 0 ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${vr.videoId}/hqdefault.jpg`;
-
-        if (title) {
-          results.push({
-            videoId: vr.videoId,
-            title: cleanText(title),
-            uploaderName: cleanText(uploaderName),
-            uploaderVerified,
-            duration,
-            views,
-            thumbnail: upgradeImage(thumbnail),
-            isShort: Boolean(duration > 0 && duration < 45)
-          });
-        }
-      }
-    }
-    return results;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Parallel YouTube + YouTube Music Search with Piped/Invidious Fallback
- */
-async function searchYouTubeFast(query, filterType = "videos", timeoutMs = 3200) {
-  if (!query) return [];
-
-  const [ytWebHits, ytmHits] = await Promise.all([
-    searchYouTubeDirectInnertube(query, timeoutMs),
-    searchYouTubeMusicDirectInnertube(query, timeoutMs)
-  ]);
-
-  const combined = [];
-  const seen = new Set();
-  for (const item of [...ytWebHits, ...ytmHits]) {
-    if (item && item.videoId && !seen.has(item.videoId)) {
-      seen.add(item.videoId);
-      combined.push(item);
-    }
-  }
-  if (combined.length > 0) return combined;
-
-  const fallbackTasks = [
-    ...PIPED_API_INSTANCES.slice(0, 3).map(async (base) => {
-      const res = await fetchWithTimeout(
-        `${base}/search?q=${encodeURIComponent(query)}&filter=${encodeURIComponent(filterType)}`,
-        { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-        2800
-      );
-      if (!res.ok) throw new Error("Piped miss");
-      const data = await res.json();
-      const items = Array.isArray(data?.items) ? data.items : [];
-      if (items.length === 0) throw new Error("Empty");
-      return items.map(it => ({
-        videoId: extractYoutubeVideoId(it.url || it.id),
-        title: cleanText(it.title || ""),
-        uploaderName: cleanText(it.uploaderName || it.author || ""),
-        uploaderVerified: Boolean(it.uploaderVerified),
-        duration: Number(it.duration || 0),
-        views: Number(it.views || 0),
-        thumbnail: upgradeImage(it.thumbnail || ""),
-        isShort: Boolean(it.isShort)
-      })).filter(x => x.videoId && x.title);
-    }),
-    ...INVIDIOUS_API_INSTANCES.slice(0, 3).map(async (base) => {
-      const res = await fetchWithTimeout(
-        `${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video`,
-        { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-        2800
-      );
-      if (!res.ok) throw new Error("Invidious miss");
-      const items = await res.json();
-      if (!Array.isArray(items) || items.length === 0) throw new Error("Empty");
-      return items.map(it => ({
-        videoId: extractYoutubeVideoId(it.videoId),
-        title: cleanText(it.title || ""),
-        uploaderName: cleanText(it.author || ""),
-        uploaderVerified: Boolean(it.authorVerified),
-        duration: Number(it.lengthSeconds || 0),
-        views: Number(it.viewCount || 0),
-        thumbnail: upgradeImage(it.videoThumbnails?.[0]?.url || ""),
-        isShort: Boolean(it.lengthSeconds > 0 && it.lengthSeconds < 45)
-      })).filter(x => x.videoId && x.title);
-    })
-  ];
-
-  try {
-    return await Promise.any(fallbackTasks);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Direct YouTube Innertube Multi-Client Stream Extractor (`fetchYouTubeDirectInnertubeStreams`)
- * Races `TVHTML5_SIMPLY_EMBEDDED_PLAYER` (with embed context), `ANDROID_VR`, `IOS`, and `ANDROID_TESTSUITE`
- * with `visitorData` support so YouTube's bot-check is bypassed on Cloudflare Edge!
- */
-async function fetchYouTubeDirectInnertubeStreams(videoId, timeoutMs = 3600) {
-  if (!videoId) return null;
-
-  const visitorToken = (CACHED_YT_VISITOR_DATA && Date.now() < CACHED_YT_VISITOR_EXP)
-    ? CACHED_YT_VISITOR_DATA
-    : undefined;
-
-  const clients = [
-    {
-      name: "ANDROID_VR",
-      userAgent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-      clientIdHeader: "28",
-      context: {
-        client: {
-          clientName: "ANDROID_VR",
-          clientVersion: "1.61.48",
-          deviceMake: "Oculus",
-          deviceModel: "Quest 3",
-          osName: "Android",
-          osVersion: "12L",
-          androidSdkVersion: 32,
-          hl: "en",
-          gl: "US",
-          ...(visitorToken ? { visitorData: visitorToken } : {})
-        }
-      }
-    },
-    {
-      name: "IOS",
-      userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)",
-      clientIdHeader: "5",
-      context: {
-        client: {
-          clientName: "IOS",
-          clientVersion: "20.10.4",
-          deviceMake: "Apple",
-          deviceModel: "iPhone16,2",
-          osName: "iPhone",
-          osVersion: "18.3.1.22D72",
-          hl: "en",
-          gl: "US",
-          ...(visitorToken ? { visitorData: visitorToken } : {})
-        }
-      }
-    },
-    {
-      name: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-      userAgent: "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15",
-      clientIdHeader: "85",
-      context: {
-        client: {
-          clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-          clientVersion: "2.0",
-          hl: "en",
-          gl: "US",
-          ...(visitorToken ? { visitorData: visitorToken } : {})
-        },
-        thirdParty: {
-          embedUrl: "https://www.youtube.com/"
-        }
-      }
-    },
-    {
-      name: "ANDROID_TESTSUITE",
-      userAgent: "com.google.android.youtube/1.9 (Linux; U; Android 12; US) gzip",
-      clientIdHeader: "30",
-      context: {
-        client: {
-          clientName: "ANDROID_TESTSUITE",
-          clientVersion: "1.9",
-          androidSdkVersion: 31,
-          osName: "Android",
-          osVersion: "12",
-          hl: "en",
-          gl: "US",
-          ...(visitorToken ? { visitorData: visitorToken } : {})
-        }
-      }
-    }
-  ];
-
-  const tryClient = async (c) => {
-    const res = await fetchWithTimeout(
-      "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": c.userAgent,
-          "X-YouTube-Client-Name": c.clientIdHeader,
-          "X-YouTube-Client-Version": c.context.client.clientVersion,
-          "Origin": "https://www.youtube.com"
-        },
-        body: JSON.stringify({
-          context: c.context,
-          videoId,
-          contentCheckOk: true,
-          racyCheckOk: true
-        })
-      },
-      timeoutMs
-    );
-
-    if (!res.ok) throw new Error(`Innertube ${c.name} HTTP ${res.status}`);
-    const data = await res.json();
-
-    if (data?.responseContext?.visitorData && !CACHED_YT_VISITOR_DATA) {
-      CACHED_YT_VISITOR_DATA = data.responseContext.visitorData;
-      CACHED_YT_VISITOR_EXP = Date.now() + 30 * 60 * 1000;
-    }
-
-    const status = data?.playabilityStatus?.status;
-    if (status !== "OK") throw new Error(`Playability ${status}`);
-
-    const adaptive = Array.isArray(data?.streamingData?.adaptiveFormats) ? data.streamingData.adaptiveFormats : [];
-    const muxed = Array.isArray(data?.streamingData?.formats) ? data.streamingData.formats : [];
-    const hlsManifestUrl = data?.streamingData?.hlsManifestUrl || null;
-    const details = data?.videoDetails || {};
-
-    const audioStreams = [];
-    const videoStreams = [];
-
-    for (const f of adaptive) {
-      if (!f || !f.url) continue;
-      const mime = String(f.mimeType || "");
-      const [typePart, codecPart] = mime.split(";");
-      const codec = (codecPart || "").match(/codecs="([^"]+)"/)?.[1] || "";
-
-      if (typePart.startsWith("audio/")) {
-        audioStreams.push({
-          url: f.url,
-          mimeType: typePart.trim(),
-          codec,
-          bitrate: Number(f.bitrate || f.averageBitrate || 0),
-          quality: `${Math.round(Number(f.bitrate || 160000) / 1000)}kbps`,
-          contentLength: Number(f.contentLength || 0)
-        });
-      } else if (typePart.startsWith("video/")) {
-        const height = Number(f.height || parseInt(f.qualityLabel || "0", 10) || 0);
-        videoStreams.push({
-          url: f.url,
-          mimeType: typePart.trim(),
-          codec,
-          format: typePart.includes("mp4") ? "MPEG_4" : "WEBM",
-          quality: f.qualityLabel || `${height}p`,
-          width: Number(f.width || 0),
-          height,
-          fps: Number(f.fps || 30),
-          bitrate: Number(f.bitrate || f.averageBitrate || 0),
-          videoOnly: true
-        });
-      }
-    }
-
-    for (const f of muxed) {
-      if (!f || !f.url) continue;
-      const mime = String(f.mimeType || "video/mp4");
-      const [typePart, codecPart] = mime.split(";");
-      const codec = (codecPart || "").match(/codecs="([^"]+)"/)?.[1] || "avc1";
-      const height = Number(f.height || parseInt(f.qualityLabel || "0", 10) || 720);
-      videoStreams.push({
-        url: f.url,
-        mimeType: typePart.trim(),
-        codec,
-        format: "MPEG_4",
-        quality: f.qualityLabel || `${height}p`,
-        width: Number(f.width || 0),
-        height,
-        fps: Number(f.fps || 30),
-        bitrate: Number(f.bitrate || f.averageBitrate || 0),
-        videoOnly: false
-      });
-    }
-
-    if (audioStreams.length === 0 && videoStreams.length === 0 && !hlsManifestUrl) {
-      throw new Error("No direct URLs in Innertube response");
-    }
-
-    return {
-      provider: `YouTubeDirectEdge (${c.name})`,
-      videoId,
-      title: cleanText(details.title || ""),
-      uploader: cleanText(details.author || ""),
-      uploaderVerified: true,
-      duration: Number(details.lengthSeconds || 0),
-      thumbnailUrl: upgradeImage(`https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`),
-      hls: hlsManifestUrl,
-      audioStreams,
-      videoStreams
-    };
-  };
-
-  try {
-    return await Promise.any(clients.map(c => tryClient(c)));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Fetches adaptive + progressive audio & video streams for a YouTube `videoId`:
- * 1. Tries Direct YouTube Innertube (`ANDROID_VR` / `IOS` / `TVHTML5_SIMPLY_EMBEDDED_PLAYER` / `ANDROID_TESTSUITE`).
- * 2. Falls back to Invidious (using `?local=true` and `/videoplayback?...&host=...` so streams are NEVER IP-blocked!) and Piped.
- */
-async function fetchYouTubeStreamsForVideoId(videoId, timeoutMs = 3800) {
-  if (!videoId) return null;
-
-  const directEdgeStreams = await fetchYouTubeDirectInnertubeStreams(videoId, timeoutMs);
-  if (directEdgeStreams && (directEdgeStreams.audioStreams.length > 0 || directEdgeStreams.videoStreams.length > 0 || directEdgeStreams.hls)) {
-    return directEdgeStreams;
-  }
-
-  const pipedStreamTasks = PIPED_API_INSTANCES.slice(0, 4).map(async (base) => {
-    const res = await fetchWithTimeout(
-      `${base}/streams/${encodeURIComponent(videoId)}`,
-      { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"], "Accept": "application/json" } },
-      timeoutMs
-    );
-    if (!res.ok) throw new Error(`Piped stream ${res.status}`);
-    const data = await res.json();
-    if (!Array.isArray(data?.audioStreams) && !Array.isArray(data?.videoStreams)) {
-      throw new Error("Invalid Piped stream payload");
-    }
-
-    // Filter out raw googlevideo.com URLs from Piped unless they use Piped's own proxy host
-    const isPlayablePipedUrl = (u) => {
-      if (!u) return false;
-      try {
-        const parsed = new URL(u);
-        return !parsed.hostname.includes("googlevideo.com") || parsed.searchParams.has("host");
-      } catch {
-        return false;
-      }
-    };
-
-    const audioStreams = (data.audioStreams || [])
-      .filter(a => isPlayablePipedUrl(a.url))
-      .map(a => ({
-        url: a.url,
-        mimeType: a.mimeType || "audio/mp4",
-        codec: a.codec || "",
-        bitrate: Number(a.bitrate || 0),
-        quality: a.quality || `${Math.round(Number(a.bitrate || 160000) / 1000)}kbps`,
-        contentLength: Number(a.contentLength || 0)
-      }));
-
-    const videoStreams = (data.videoStreams || [])
-      .filter(v => isPlayablePipedUrl(v.url))
-      .map(v => ({
-        url: v.url,
-        mimeType: v.mimeType || "video/mp4",
-        codec: v.codec || "",
-        format: v.format || "",
-        quality: v.quality || `${v.height || 1080}p`,
-        width: Number(v.width || 0),
-        height: Number(v.height || parseInt(v.quality || "0", 10) || 0),
-        fps: Number(v.fps || 30),
-        bitrate: Number(v.bitrate || 0),
-        videoOnly: Boolean(v.videoOnly)
-      }));
-
-    if (audioStreams.length === 0 && videoStreams.length === 0 && !data.hls) {
-      throw new Error("No proxy-safe streams in Piped response");
-    }
-
-    return {
-      provider: `Piped (${new URL(base).hostname})`,
-      videoId,
-      title: cleanText(data.title || ""),
-      uploader: cleanText(data.uploader || ""),
-      uploaderVerified: Boolean(data.uploaderVerified),
-      duration: Number(data.duration || 0),
-      thumbnailUrl: upgradeImage(data.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`),
-      hls: data.hls || null,
-      audioStreams,
-      videoStreams
-    };
-  });
-
-  const invidiousStreamTasks = INVIDIOUS_API_INSTANCES.slice(0, 4).map(async (base) => {
-    const res = await fetchWithTimeout(
-      `${base}/api/v1/videos/${encodeURIComponent(videoId)}?local=true`,
-      { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"], "Accept": "application/json" } },
-      timeoutMs
-    );
-    if (!res.ok) throw new Error(`Invidious video ${res.status}`);
-    const data = await res.json();
-    const adaptive = Array.isArray(data?.adaptiveFormats) ? data.adaptiveFormats : [];
-    const muxed = Array.isArray(data?.formatStreams) ? data.formatStreams : [];
-    if (adaptive.length === 0 && muxed.length === 0) throw new Error("Empty Invidious formats");
-
-    // Rewrite any raw googlevideo.com URL to tunnel through the Invidious server's `/videoplayback` proxy!
-    const rewriteInvidiousTunnel = (rawUrl, isMuxed = false) => {
-      if (!rawUrl) return "";
-      if (rawUrl.startsWith("/")) return `${base}${rawUrl}`;
-      try {
-        const u = new URL(rawUrl);
-        if (u.hostname.includes("googlevideo.com")) {
-          if (isMuxed && u.searchParams.get("itag")) {
-            return `${base}/latest_version?id=${encodeURIComponent(videoId)}&itag=${u.searchParams.get("itag")}&local=true`;
-          }
-          u.searchParams.set("host", u.hostname);
-          return `${base}/videoplayback?${u.searchParams.toString()}`;
-        }
-      } catch {}
-      return rawUrl;
-    };
-
-    const audioStreams = adaptive
-      .filter(f => String(f.type || "").startsWith("audio/") && f.url)
-      .map(a => ({
-        url: rewriteInvidiousTunnel(a.url, false),
-        mimeType: String(a.type).split(";")[0].trim(),
-        codec: a.encoding || "",
-        bitrate: Number(a.bitrate || 0),
-        quality: `${Math.round(Number(a.bitrate || 160000) / 1000)}kbps`,
-        contentLength: Number(a.clen || 0)
-      }));
-
-    const videoOnlyStreams = adaptive
-      .filter(f => String(f.type || "").startsWith("video/") && f.url)
-      .map(v => {
-        const resParts = String(v.size || "").split("x").map(Number);
-        const height = resParts[1] || parseInt(v.qualityLabel || "0", 10) || 0;
-        return {
-          url: rewriteInvidiousTunnel(v.url, false),
-          mimeType: String(v.type).split(";")[0].trim(),
-          codec: v.encoding || "",
-          format: v.container || "",
-          quality: v.qualityLabel || `${height}p`,
-          width: resParts[0] || 0,
-          height,
-          fps: Number(v.fps || 30),
-          bitrate: Number(v.bitrate || 0),
-          videoOnly: true
-        };
-      });
-
-    const muxedStreams = muxed
-      .filter(f => f.url)
-      .map(v => {
-        const height = parseInt(v.resolution || v.qualityLabel || "0", 10) || 720;
-        return {
-          url: rewriteInvidiousTunnel(v.url, true),
-          mimeType: String(v.type || "video/mp4").split(";")[0].trim(),
-          codec: v.encoding || "avc1",
-          format: v.container || "mp4",
-          quality: v.qualityLabel || `${height}p`,
-          width: 0,
-          height,
-          fps: Number(v.fps || 30),
-          bitrate: Number(v.bitrate || 0),
-          videoOnly: false
-        };
-      });
-
-    return {
-      provider: `Invidious (${new URL(base).hostname})`,
-      videoId,
-      title: cleanText(data.title || ""),
-      uploader: cleanText(data.author || ""),
-      uploaderVerified: Boolean(data.authorVerified),
-      duration: Number(data.lengthSeconds || 0),
-      thumbnailUrl: upgradeImage(`https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`),
-      hls: data.hlsUrl ? (data.hlsUrl.startsWith("/") ? `${base}${data.hlsUrl}` : data.hlsUrl) : null,
-      audioStreams,
-      videoStreams: [...muxedStreams, ...videoOnlyStreams]
-    };
-  });
-
-  try {
-    return await Promise.any([...invidiousStreamTasks, ...pipedStreamTasks]);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Secondary High-Resolution Audio Resolver (`resolveSecondaryHighResAudioStream`)
- * Streams high-bitrate M4A/Opus audio from YouTube / YouTube Music for any song unavailable on JioSaavn.
- */
-async function resolveSecondaryHighResAudioStream({ title, artist, album, durationSec = 0, ytVideoId = "", preferredQuality = "320" }) {
-  const coreTitle = extractCoreTrackTitle(title) || cleanText(title);
-  const primaryArtist = cleanText(String(artist || "").split(/[,&]/)[0]);
-  const memoKey = `sec_audio_v13__${normalizeTokenComparison(coreTitle)}__${normalizeTokenComparison(primaryArtist)}__${preferredQuality}`;
-
-  if (SECONDARY_AUDIO_MEMO.has(memoKey)) {
-    return SECONDARY_AUDIO_MEMO.get(memoKey);
-  }
-
-  let candidateVideoIds = [];
-  if (ytVideoId) {
-    candidateVideoIds.push(extractYoutubeVideoId(ytVideoId));
-  }
-
-  if (candidateVideoIds.length === 0 && coreTitle) {
-    const query = [coreTitle, primaryArtist || album].filter(Boolean).join(" ").trim();
-    const ytHits = await searchYouTubeFast(query, "videos", 3000);
-
-    const targetVariant = extractTrackVariantTag(title, album);
-    const normTargetTitle = normalizeTokenComparison(coreTitle);
-    const normTargetArtist = normalizeTokenComparison(primaryArtist);
-
-    const scored = [];
-    const seenIds = new Set();
-
-    for (let idx = 0; idx < ytHits.length; idx++) {
-      const item = ytHits[idx];
-      if (!item.videoId || seenIds.has(item.videoId) || item.isShort) continue;
-      seenIds.add(item.videoId);
-
-      const itemTitleNorm = normalizeTokenComparison(extractCoreTrackTitle(item.title) || item.title);
-      const itemUploaderNorm = normalizeTokenComparison(item.uploaderName.replace(/\s*-\s*topic$/i, ""));
-      const itemVariant = extractTrackVariantTag(item.title, "");
-
-      if (targetVariant === "standard" && itemVariant !== "standard" && itemVariant !== "cover") continue;
-      if (/\b(karaoke|8d|ringtone|tutorial|reaction|instrumental\s+version)\b/i.test(item.title) && !/\b(karaoke|instrumental)\b/i.test(title)) {
-        continue;
-      }
-
-      let score = 0;
-      const sim = computeStringSimilarity(itemTitleNorm, normTargetTitle);
-      if (itemTitleNorm === normTargetTitle) {
-        score += 115;
-      } else if (sim >= 0.65) {
-        score += Math.round(sim * 100);
-      } else if (itemTitleNorm.includes(normTargetTitle) || normTargetTitle.includes(itemTitleNorm)) {
-        score += 80;
-      } else if (idx <= 2 && item.views > 1_000_000) {
-        score += 85;
-      } else {
-        continue;
-      }
-
-      if (normTargetArtist) {
-        const artistWords = normTargetArtist.split(" ").filter(w => w.length >= 3);
-        if (
-          itemUploaderNorm.includes(normTargetArtist) ||
-          itemTitleNorm.includes(normTargetArtist) ||
-          artistWords.some(w => w.length >= 4 && (itemUploaderNorm.includes(w) || itemTitleNorm.includes(w)))
-        ) {
-          score += 75;
-        }
-      }
-
-      if (item.musicVideoType === "MUSIC_VIDEO_TYPE_ATV" || /-\s*topic$/i.test(item.uploaderName)) score += 75;
-      if (item.uploaderVerified || /vevo|official/i.test(item.uploaderName)) score += 45;
-      if (/\b(official\s+audio|official\s+music\s+video|official\s+video|lyrical|lyric\s+video)\b/i.test(item.title)) score += 35;
-
-      if (item.views > 50_000_000) score += 45;
-      else if (item.views > 1_000_000) score += 25;
-
-      if (durationSec > 0 && item.duration > 0) {
-        const diff = Math.abs(durationSec - item.duration);
-        if (diff <= 6) score += 55;
-        else if (diff <= 20) score += 30;
-        else if (diff > 90) score -= 50;
-      }
-
-      scored.push({ videoId: item.videoId, score });
-    }
-
-    scored.sort((a, b) => b.score - a.score);
-    candidateVideoIds = scored.slice(0, 3).map(x => x.videoId);
-  }
-
-  for (const vid of candidateVideoIds) {
-    const streamData = await fetchYouTubeStreamsForVideoId(vid, 3600);
-    if (!streamData || !Array.isArray(streamData.audioStreams) || streamData.audioStreams.length === 0) continue;
-
-    const sortedAudio = [...streamData.audioStreams].sort((a, b) => {
-      const aIsMp4 = a.mimeType.includes("mp4") || a.mimeType.includes("m4a") ? 1 : 0;
-      const bIsMp4 = b.mimeType.includes("mp4") || b.mimeType.includes("m4a") ? 1 : 0;
-      if (preferredQuality === "320") {
-        return (b.bitrate + bIsMp4 * 25000) - (a.bitrate + aIsMp4 * 25000);
-      }
-      return a.bitrate - b.bitrate;
-    });
-
-    const bestAudio = sortedAudio[0];
-    if (bestAudio?.url) {
-      const result = {
-        videoId: vid,
-        streamUrl: bestAudio.url,
-        fallbackUrls: sortedAudio.slice(1, 4).map(a => a.url),
-        mimeType: bestAudio.mimeType || "audio/mp4",
-        bitrate: bestAudio.bitrate ? `${Math.round(bestAudio.bitrate / 1000)}kbps` : "160kbps",
-        provider: streamData.provider,
-        title: streamData.title || title,
-        uploader: streamData.uploader || artist,
-        duration: streamData.duration || durationSec,
-        thumbnailUrl: streamData.thumbnailUrl
-      };
-      setBoundedMemo(SECONDARY_AUDIO_MEMO, memoKey, result, 600);
-      return result;
-    }
-  }
-
-  return null;
-}
-
-/**
- * Tiered Music Video Classifier (`scoreOfficialMusicVideoCandidate`)
- * Upgraded in v13:
- * - Prioritizes Official Music Videos (+135) > Official Visualizers (+75) > Official Lyrical Videos (+45)
- * - Strongly rewards videos whose duration closely matches the studio song duration (`diff <= 6s` -> +95 pts!)
- *   so the video plays in tight sync with the music!
- * - Rejects fan-made AMVs, Gacha/Minecraft/Roblox, covers, tutorials, reactions, and Shorts.
- */
-function scoreOfficialMusicVideoCandidate(item, coreTitle, primaryArtist, albumName, targetDurationSec = 0, rankIdx = 0) {
-  if (!item || !item.videoId || !item.title || item.isShort) return -999;
-
-  const rawTitle = item.title;
-  const lowerTitle = rawTitle.toLowerCase();
-  const uploader = item.uploaderName || "";
-  const lowerUploader = uploader.toLowerCase();
-
-  // Reject fan-made AMVs, gaming edits, covers, karaoke, reactions, tutorials, and teasers
-  const hardRejectPatterns = [
-    /\b(amv|anime\s+mv|anime\s+music\s+video|gacha|minecraft|roblox|fortnite|fan\s*made|fan\s+animation|ai\s+video|ai\s+generated)\b/i,
-    /\b(karaoke|instrumental|8d\s+audio|slowed|reverb|sped\s+up|nightcore|ringtone|reaction|review|tutorial|guitar\s+lesson|piano\s+cover|cover\s+version|dance\s+cover|making\s+of|behind\s+the\s+scenes|teaser|trailer|interview|jukebox|full\s+album)\b/i
-  ];
-
-  for (const rx of hardRejectPatterns) {
-    if (rx.test(lowerTitle)) return -999;
-  }
-
-  if (item.duration > 0 && (item.duration < 55 || item.duration > 720)) {
-    return -999;
-  }
-
-  const normTargetTitle = normalizeTokenComparison(coreTitle);
-  const normItemTitle = normalizeTokenComparison(extractCoreTrackTitle(rawTitle) || rawTitle);
-  const normAlbum = normalizeTokenComparison(albumName || "");
-  const normArtist = normalizeTokenComparison(primaryArtist || "");
-
-  let score = 0;
-  const titleSim = computeStringSimilarity(normItemTitle, normTargetTitle);
-
-  if (normItemTitle === normTargetTitle) {
-    score += 120;
-  } else if (normItemTitle.includes(normTargetTitle) || normTargetTitle.includes(normItemTitle)) {
-    score += 95;
-  } else if (titleSim >= 0.62) {
-    score += Math.round(titleSim * 95);
-  } else if (rankIdx <= 3 && (item.views > 500_000 || item.isOfficialMusicVideo)) {
-    score += 80;
-  } else {
-    const titleWords = normTargetTitle.split(" ").filter(w => w.length >= 3);
-    const matched = titleWords.filter(w => normItemTitle.includes(w));
-    if (titleWords.length > 0 && matched.length >= Math.ceil(titleWords.length * 0.65)) {
-      score += 75;
-    } else {
-      return -500;
-    }
-  }
-
-  // Tiered Video Type Scoring (Official MV > Visualizer > Lyrical > Static Topic)
-  if (item.isOfficialMusicVideo || item.musicVideoType === "MUSIC_VIDEO_TYPE_OMV") {
-    score += 125;
-  }
-  if (/\b(official\s+music\s+video|official\s+video|official\s+mv|m\/v|full\s+video\s+song|video\s+song|full\s+video|4k\s+video|4k\s+remaster)\b/i.test(rawTitle)) {
-    score += 135;
-  } else if (/\b(music\s+video|mv|video)\b/i.test(rawTitle) && !/\b(lyric|lyrical)\b/i.test(rawTitle)) {
-    score += 85;
-  } else if (/\b(visualizer|visualiser|performance\s+video|studio\s+video)\b/i.test(rawTitle)) {
-    score += 70;
-  } else if (/\b(lyrical\s+video|lyric\s+video|lyrical\s+song|lyrical)\b/i.test(rawTitle)) {
-    score += 45;
-  } else if (/-\s*topic$/i.test(uploader) || /\b(official\s+audio|audio\s+only)\b/i.test(rawTitle)) {
-    score -= 40; // Deprioritize static cover-art audio tracks when real videos exist
-  }
-
-  if (item.uploaderVerified) score += 55;
-  if (/vevo|t-series|sony\s*music|saregama|zee\s*music|yrf|think\s*music|aditya\s*music|lahari|muzic247|manorama\s*music|bhavna\s*studios|hombale|junglee|universal\s*music|warner\s*music|atlantic|interscope|republic\s*records|columbia|hybe|smtown|jyp|yg/i.test(lowerUploader)) {
-    score += 65;
-  }
-
-  if (normArtist) {
-    const artWords = normArtist.split(" ").filter(w => w.length >= 3);
-    if (
-      lowerUploader.includes(normArtist) ||
-      normItemTitle.includes(normArtist) ||
-      artWords.some(w => w.length >= 4 && (lowerUploader.includes(w) || normItemTitle.includes(w)))
-    ) {
-      score += 75;
-    }
-  }
-
-  if (normAlbum && normAlbum !== "openmuse" && normItemTitle.includes(normAlbum)) {
-    score += 50;
-  }
-
-  // Audio-Video Sync Alignment Bonus: Strongly prefer videos whose duration matches the song!
-  if (targetDurationSec > 0 && item.duration > 0) {
-    const diff = Math.abs(targetDurationSec - item.duration);
-    if (diff <= 5) score += 95;
-    else if (diff <= 15) score += 65;
-    else if (diff <= 35) score += 35;
-    else if (diff <= 75) score += 10;
-    else if (diff > 150) score -= 65;
-  }
-
-  if (item.views > 50_000_000) score += 45;
-  else if (item.views > 5_000_000) score += 30;
-  else if (item.views > 500_000) score += 15;
-
-  return score;
-}
-
-/**
- * Apple Music / iTunes Official HD Music Video Resolver (`fetchAppleMusicVideoFallback`)
- * Queries both `IN` and `US` storefronts for official H.264 `.m4v` HD Music Videos (`video-ssl.itunes.apple.com`).
- */
-async function fetchAppleMusicVideoFallback(coreTitle, primaryArtist, timeoutMs = 2600) {
-  if (!coreTitle) return null;
-  try {
-    const q = [coreTitle, primaryArtist].filter(Boolean).join(" ").trim();
-    const [inRes, usRes] = await Promise.allSettled([
-      fetchWithTimeout(
-        `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&country=in&media=musicVideo&entity=musicVideo&limit=5`,
-        { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-        timeoutMs
-      ).then(r => r.ok ? r.json() : null),
-      fetchWithTimeout(
-        `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&country=us&media=musicVideo&entity=musicVideo&limit=5`,
-        { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-        timeoutMs
-      ).then(r => r.ok ? r.json() : null)
-    ]);
-
-    const results = [
-      ...(inRes.status === "fulfilled" && Array.isArray(inRes.value?.results) ? inRes.value.results : []),
-      ...(usRes.status === "fulfilled" && Array.isArray(usRes.value?.results) ? usRes.value.results : [])
-    ];
-
-    const normTargetTitle = normalizeTokenComparison(coreTitle);
-    const normTargetArtist = normalizeTokenComparison(primaryArtist);
-
-    for (const r of results) {
-      if (!r?.previewUrl) continue;
-      const rTitle = normalizeTokenComparison(extractCoreTrackTitle(r.trackName || "") || r.trackName || "");
-      const rArt = normalizeTokenComparison(r.artistName || "");
-      const titleSim = computeStringSimilarity(rTitle, normTargetTitle);
-      if (titleSim < 0.55 && !rTitle.includes(normTargetTitle) && !normTargetTitle.includes(rTitle)) continue;
-      if (normTargetArtist && rArt && !rArt.includes(normTargetArtist) && !normTargetArtist.includes(rArt)) {
-        const artWords = normTargetArtist.split(" ").filter(w => w.length >= 3);
-        if (!artWords.some(w => rArt.includes(w))) continue;
-      }
-
-      return {
-        status: "ok",
-        videoId: `apple_mv_${r.trackId}`,
-        title: cleanText(r.trackName || coreTitle),
-        channel: cleanText(r.artistName || primaryArtist),
-        channelVerified: true,
-        duration: r.trackTimeMillis ? Math.round(r.trackTimeMillis / 1000) : 0,
-        thumbnailUrl: upgradeImage(r.artworkUrl100 || ""),
-        provider: "AppleMusicOfficialHDVideo",
-        audioIncluded: true,
-        captionsIncluded: false,
-        embedUsed: false,
-        selectedStream: {
-          url: r.previewUrl,
-          resolution: "1080p",
-          width: 1920,
-          height: 1080,
-          fps: 30,
-          mimeType: "video/mp4",
-          codec: "avc1.640028",
-          bitrate: 4500000,
-          videoOnly: false
-        },
-        fallbackStreamUrls: [r.previewUrl],
-        companionAudioStream: null,
-        availableVideoOnlyQualities: [{
-          resolution: "1080p",
-          height: 1080,
-          fps: 30,
-          mimeType: "video/mp4",
-          codec: "avc1.640028",
-          videoOnly: false,
-          url: r.previewUrl
-        }]
-      };
-    }
-  } catch {}
-  return null;
-}
-
-/**
- * Resolves the Official Music Video in Highest Browser-Compatible Quality (`resolveOfficialMusicVideoStream`)
- * Upgraded in v13:
- * 1. Runs YouTube + YouTube Music + Apple Music HD Video searches in parallel.
- * 2. Prioritizes H.264 (`avc1`) MP4 streams so `<video>` tags in Chrome, Safari, iOS, Android, and Firefox parse the video 100% of the time without MSE errors!
- * 3. Computes `syncMetadata` (`durationDeltaSec`, `estimatedVideoIntroOffsetSec`, `companionAudioUrl`) so the frontend can sync the video with the song!
- * 4. Builds a `fallbackStreamUrls` cascade so `pipeMediaStreamWithFallback` never fails with 403/404.
- */
-async function resolveOfficialMusicVideoStream({
-  songId = "",
-  title = "",
-  artist = "",
-  album = "",
-  durationSec = 0,
-  explicitVideoId = "",
-  includeAudio = false,
-  maxHeight = 2160,
-  preferContainer = "mp4"
-}) {
-  if (songId && SONG_META_MEMO.has(songId)) {
-    const memo = SONG_META_MEMO.get(songId);
-    if (!title) title = memo.title || "";
-    if (!artist) artist = memo.artist || "";
-    if (!album || album === "OpenMuse") album = memo.album || "";
-    if (!durationSec && memo.duration) durationSec = memo.duration;
-    if (!explicitVideoId && memo.ytVideoId) explicitVideoId = memo.ytVideoId;
-  }
-
-  const coreTitle = extractCoreTrackTitle(title) || cleanText(title);
-  const primaryArtist = cleanText(String(artist || "").split(/[,&]/)[0]);
-  const cleanAlbum = cleanText(album && album !== "OpenMuse" ? album : "");
-
-  const memoKey = `vid_v13__${explicitVideoId || normalizeTokenComparison(`${coreTitle}_${primaryArtist}`)}__a${includeAudio ? 1 : 0}__h${maxHeight}`;
-  if (VIDEO_STREAM_MEMO.has(memoKey)) {
-    return VIDEO_STREAM_MEMO.get(memoKey);
-  }
-
-  let candidateVideos = [];
-
-  if (explicitVideoId && extractYoutubeVideoId(explicitVideoId)) {
-    candidateVideos.push({ videoId: extractYoutubeVideoId(explicitVideoId), score: 999 });
-  }
-
-  const q1 = [coreTitle, primaryArtist, "official music video"].filter(Boolean).join(" ");
-  const q2 = cleanAlbum ? `${coreTitle} ${cleanAlbum} video song` : "";
-
-  const [ytResults1, ytResults2, appleMvFallback] = await Promise.all([
-    coreTitle ? searchYouTubeFast(q1, "videos", 3200) : Promise.resolve([]),
-    q2 ? searchYouTubeFast(q2, "videos", 2800) : Promise.resolve([]),
-    fetchAppleMusicVideoFallback(coreTitle, primaryArtist, 2600)
-  ]);
-
-  const seenIds = new Set(candidateVideos.map(c => c.videoId));
-  const allYtSearchHits = [...ytResults1, ...ytResults2];
-
-  for (let idx = 0; idx < allYtSearchHits.length; idx++) {
-    const item = allYtSearchHits[idx];
-    if (!item?.videoId || seenIds.has(item.videoId)) continue;
-    seenIds.add(item.videoId);
-    const sc = scoreOfficialMusicVideoCandidate(item, coreTitle, primaryArtist, cleanAlbum, durationSec, idx);
-    if (sc >= 45) {
-      candidateVideos.push({ ...item, score: sc });
-    }
-  }
-
-  candidateVideos.sort((a, b) => b.score - a.score);
-
-  for (const cand of candidateVideos.slice(0, 3)) {
-    const streamInfo = await fetchYouTubeStreamsForVideoId(cand.videoId, 3800);
-    if (!streamInfo || (!Array.isArray(streamInfo.videoStreams) || streamInfo.videoStreams.length === 0)) {
-      continue;
-    }
-
-    const allVideoStreams = streamInfo.videoStreams.filter(v => v && v.url);
-    const pureVideoOnly = allVideoStreams.filter(v => v.videoOnly === true && (!maxHeight || v.height <= maxHeight));
-    const muxedVideoWithAudio = allVideoStreams.filter(v => v.videoOnly === false && (!maxHeight || v.height <= maxHeight));
-
-    // Rank H.264 (avc1) MP4 highest so standard HTML5 <video> elements parse & seek without MSE errors!
-    const rankStream = (v) => {
-      const h = v.height || parseInt(v.quality || "0", 10) || 0;
-      const isMp4 = String(v.mimeType || "").includes("mp4") || String(v.format || "").toLowerCase().includes("mpeg_4") ? 1 : 0;
-      const isAvc = /avc1/i.test(v.codec || "") ? 3 : (/hev1|hvc1/i.test(v.codec || "") ? 1 : (/vp9|av01/i.test(v.codec || "") ? 0 : 2));
-      const containerBonus = preferContainer === "mp4" ? isMp4 * 120 : 0;
-      return h * 100 + (v.fps >= 50 ? 20 : 0) + containerBonus + isAvc * 85 + Math.round((v.bitrate || 0) / 100000);
-    };
-
-    pureVideoOnly.sort((a, b) => rankStream(b) - rankStream(a));
-    muxedVideoWithAudio.sort((a, b) => rankStream(b) - rankStream(a));
-
-    // For universal <video src="..."> compatibility:
-    // If includeAudio is true, prefer muxed MP4.
-    // If includeAudio is false, pick the best H.264 MP4 stream (whether videoOnly or muxed, since <video muted> ignores audio track anyway!).
-    const avcCandidates = [...muxedVideoWithAudio, ...pureVideoOnly].filter(v =>
-      String(v.mimeType || "").includes("mp4") && !/av01|vp9/i.test(v.codec || "")
-    );
-    avcCandidates.sort((a, b) => rankStream(b) - rankStream(a));
-
-    const selectedPool = includeAudio
-      ? (muxedVideoWithAudio.length > 0 ? muxedVideoWithAudio : (avcCandidates.length > 0 ? avcCandidates : pureVideoOnly))
-      : (avcCandidates.length > 0 ? avcCandidates : (pureVideoOnly.length > 0 ? pureVideoOnly : muxedVideoWithAudio));
-
-    const bestVideo = selectedPool[0] || allVideoStreams[0];
-    if (!bestVideo) continue;
-
-    const bestAudio = Array.isArray(streamInfo.audioStreams) && streamInfo.audioStreams.length > 0
-      ? [...streamInfo.audioStreams].sort((a, b) => b.bitrate - a.bitrate)[0]
-      : null;
-
-    const fallbackStreamUrls = [
-      bestVideo.url,
-      ...muxedVideoWithAudio.map(v => v.url),
-      ...pureVideoOnly.slice(0, 3).map(v => v.url),
-      ...(appleMvFallback?.selectedStream?.url ? [appleMvFallback.selectedStream.url] : [])
-    ].filter(Boolean);
-
-    const videoDur = streamInfo.duration || cand.duration || durationSec || 0;
-    const durDelta = (durationSec > 0 && videoDur > 0) ? (videoDur - durationSec) : 0;
-    const estimatedIntroOffsetSec = durDelta > 2 && durDelta < 45 ? Number((durDelta * 0.45).toFixed(2)) : 0;
-
-    const payload = {
-      status: "ok",
-      videoId: cand.videoId,
-      title: streamInfo.title || cand.title || title,
-      channel: streamInfo.uploader || cand.uploaderName || artist,
-      channelVerified: Boolean(streamInfo.uploaderVerified || cand.uploaderVerified),
-      duration: videoDur,
-      thumbnailUrl: streamInfo.thumbnailUrl || cand.thumbnail,
-      provider: streamInfo.provider,
-      audioIncluded: !bestVideo.videoOnly,
-      captionsIncluded: false,
-      embedUsed: false,
-      hlsManifestUrl: streamInfo.hls || null,
-      syncMetadata: {
-        audioDurationSec: durationSec || videoDur,
-        videoDurationSec: videoDur,
-        durationDeltaSec: durDelta,
-        estimatedVideoIntroOffsetSec: estimatedIntroOffsetSec,
-        estimatedVideoIntroOffsetMs: Math.round(estimatedIntroOffsetSec * 1000),
-        isExactDurationMatch: Math.abs(durDelta) <= 4,
-        recommendedPlaybackMode: "muted_video_with_master_audio"
-      },
-      selectedStream: {
-        url: bestVideo.url,
-        resolution: bestVideo.quality || `${bestVideo.height}p`,
-        width: bestVideo.width || 0,
-        height: bestVideo.height || 0,
-        fps: bestVideo.fps || 30,
-        mimeType: bestVideo.mimeType || "video/mp4",
-        codec: bestVideo.codec || "avc1",
-        bitrate: bestVideo.bitrate || 0,
-        videoOnly: Boolean(bestVideo.videoOnly)
-      },
-      muxedStream: muxedVideoWithAudio[0] || null,
-      videoOnlyStream: pureVideoOnly[0] || null,
-      appleFallbackStream: appleMvFallback?.selectedStream || null,
-      fallbackStreamUrls: [...new Set(fallbackStreamUrls)],
-      companionAudioStream: bestAudio || null,
-      availableVideoOnlyQualities: [...pureVideoOnly, ...muxedVideoWithAudio].slice(0, 8).map(v => ({
-        resolution: v.quality || `${v.height}p`,
-        height: v.height,
-        fps: v.fps,
-        mimeType: v.mimeType,
-        codec: v.codec,
-        videoOnly: Boolean(v.videoOnly),
-        url: v.url
-      }))
-    };
-
-    setBoundedMemo(VIDEO_STREAM_MEMO, memoKey, payload, 500);
-    return payload;
-  }
-
-  if (appleMvFallback) {
-    setBoundedMemo(VIDEO_STREAM_MEMO, memoKey, appleMvFallback, 500);
-    return appleMvFallback;
-  }
-
-  return null;
-}
-
-/**
- * Self-Healing Zero-Copy Media Stream Pipe (`pipeMediaStreamWithFallback`)
- * Tests each candidate URL in `candidateUrls`. If the first URL returns 403/404,
- * automatically fails over to the next candidate URL before sending headers to the browser!
- */
-async function pipeMediaStreamWithFallback(request, candidateUrls, extraResponseHeaders = {}) {
-  const urls = (Array.isArray(candidateUrls) ? candidateUrls : [candidateUrls]).filter(Boolean);
-  if (urls.length === 0) {
-    return jsonResponse({ error: "NoMediaStreamCandidates" }, 404);
-  }
-
-  let lastUpstreamRes = null;
-
-  for (const targetMediaUrl of [...new Set(urls)]) {
-    let parsed;
-    try {
-      parsed = new URL(targetMediaUrl);
-    } catch {
-      continue;
-    }
-
-    const host = parsed.hostname.toLowerCase();
-    const isGoogleVideo = host.includes("googlevideo.com");
-    const isAppleVideo = host.includes("itunes.apple.com") || host.includes("mzstatic.com");
-    const isPipedProxy = host.includes("piped");
-
-    // Pick the exact User-Agent matching the c= parameter in googlevideo.com URLs
-    let ua = SAAVN_HEADERS["User-Agent"];
-    if (isGoogleVideo) {
-      const cParam = (parsed.searchParams.get("c") || "ANDROID_VR").toUpperCase();
-      if (cParam.includes("IOS")) {
-        ua = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)";
-      } else if (cParam.includes("ANDROID_TESTSUITE")) {
-        ua = "com.google.android.youtube/1.9 (Linux; U; Android 12; US) gzip";
-      } else if (cParam.includes("TVHTML5")) {
-        ua = "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15";
-      } else {
-        ua = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-      }
-    }
-
-    const upstreamHeaders = new Headers({
-      "User-Agent": ua,
-      "Accept": "*/*"
-    });
-
-    if (isAppleVideo) {
-      upstreamHeaders.set("Referer", "https://music.apple.com/");
-      upstreamHeaders.set("Origin", "https://music.apple.com");
-    } else if (isPipedProxy) {
-      upstreamHeaders.set("Referer", "https://piped.video/");
-      upstreamHeaders.set("Origin", "https://piped.video");
-    } else if (!isGoogleVideo) {
-      upstreamHeaders.set("Referer", `${parsed.origin}/`);
-    }
-
-    if (request.headers.has("Range")) {
-      upstreamHeaders.set("Range", request.headers.get("Range"));
-    }
-    if (request.headers.has("If-Range")) {
-      upstreamHeaders.set("If-Range", request.headers.get("If-Range"));
-    }
-
-    try {
-      const upstreamRes = await fetchWithTimeout(targetMediaUrl, {
-        method: request.method === "HEAD" ? "HEAD" : "GET",
-        headers: upstreamHeaders,
-        redirect: "follow"
-      }, 6500);
-
-      lastUpstreamRes = upstreamRes;
-
-      if (upstreamRes.ok || upstreamRes.status === 206) {
-        const resHeaders = new Headers(CORS_HEADERS);
-        for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]) {
-          if (upstreamRes.headers.has(h)) {
-            resHeaders.set(h, upstreamRes.headers.get(h));
-          }
-        }
-
-        if (!resHeaders.has("content-type") || resHeaders.get("content-type").includes("text/plain")) {
-          resHeaders.set("Content-Type", "video/mp4");
-        }
-        if (!resHeaders.has("accept-ranges")) {
-          resHeaders.set("Accept-Ranges", "bytes");
-        }
-        resHeaders.delete("content-encoding");
-        resHeaders.set("Cache-Control", "public, max-age=21600");
-        resHeaders.set("X-Worker-Engine", `${WORKER_NAME}/${WORKER_VERSION}`);
-        resHeaders.set("X-Upstream-Status", String(upstreamRes.status));
-
-        for (const [k, v] of Object.entries(extraResponseHeaders)) {
-          if (v !== undefined && v !== null) resHeaders.set(k, String(v));
-        }
-
-        return new Response(upstreamRes.body, {
-          status: upstreamRes.status,
-          statusText: upstreamRes.statusText,
-          headers: resHeaders
-        });
-      }
-    } catch {}
-  }
-
-  return jsonResponse({
-    error: "UpstreamVideoStreamFailed",
-    upstreamStatus: lastUpstreamRes?.status || 502,
-    message: "All candidate video streams returned an error."
-  }, 502);
-}
-
-/**
- * `/video` Endpoint Handler (`handleVideoEndpoint`)
- * Smart Content Negotiation:
- * - Automatically detects whether the request is a `fetch()` JSON metadata call vs an HTML5 `<video src="...">` media element request!
- * - In JSON mode: returns complete stream URLs (proxied via `/stream` to strip CORS), `syncMetadata` for audio-video alignment, and `companionAudioUrl`.
- * - In Stream mode: pipes the MP4 video zero-copy with automatic multi-stream failover (`pipeMediaStreamWithFallback`).
- */
-async function handleVideoEndpoint(request, url, ctx) {
-  const songId = (url.searchParams.get("id") || url.searchParams.get("pid") || "").trim();
-  const explicitVideoId = (url.searchParams.get("videoId") || url.searchParams.get("ytVideoId") || url.searchParams.get("v") || "").trim();
-  let title = cleanText(url.searchParams.get("title") || url.searchParams.get("trackName") || url.searchParams.get("q") || "");
-  let artist = cleanText(url.searchParams.get("artist") || url.searchParams.get("artistName") || "");
-  let album = cleanText(url.searchParams.get("album") || url.searchParams.get("albumName") || "");
-  let durationSec = parseInt(url.searchParams.get("duration") || "0", 10) || 0;
-
-  const includeAudio = url.searchParams.get("audio") === "1" || url.searchParams.get("audio") === "true";
-  const maxHeight = parseInt(url.searchParams.get("maxHeight") || url.searchParams.get("resolution") || "2160", 10) || 2160;
-  const rawMode = (url.searchParams.get("mode") || url.searchParams.get("format") || "").toLowerCase();
-
-  // Smart detection: Is the caller an HTML5 <video> element or a JS fetch() call expecting JSON?
-  const secFetchDest = (request.headers.get("Sec-Fetch-Dest") || "").toLowerCase();
-  const acceptHeader = (request.headers.get("Accept") || "").toLowerCase();
-  const hasRangeHeader = request.headers.has("Range");
-
-  const isExplicitJson = rawMode === "json" || rawMode === "meta" || url.searchParams.get("meta") === "1";
-  const isExplicitStream = rawMode === "stream" || rawMode === "raw" || url.searchParams.get("stream") === "1";
-  const isBrowserVideoElement = secFetchDest === "video" || secFetchDest === "media" || hasRangeHeader || acceptHeader.startsWith("video/");
-
-  const shouldReturnJson = isExplicitJson || (!isExplicitStream && !isBrowserVideoElement && (acceptHeader.includes("application/json") || secFetchDest === "empty"));
-
-  if (songId && !title && /^\d+$/.test(songId)) {
-    try {
-      const details = await fetchSaavnJson({ __call: "song.getDetails", pids: songId }, 2800);
-      const rawSong = details?.[songId] || details?.songs?.[0] || Object.values(details || {})[0];
-      if (rawSong) {
-        const enriched = enrichSaavnSong(rawSong, url.origin);
-        title = enriched.title;
-        artist = enriched.artist;
-        album = enriched.album;
-        durationSec = enriched.duration;
-      }
-    } catch {}
-  }
-
-  if (!title && !explicitVideoId && !songId) {
-    return jsonResponse({
-      error: "MissingVideoQuery",
-      message: "Pass ?id=<songId> or ?title=<songTitle>&artist=<artistName> to stream or parse the official video."
-    }, 400);
-  }
-
-  const resolvedVideo = await resolveOfficialMusicVideoStream({
-    songId,
-    title,
-    artist,
-    album,
-    durationSec,
-    explicitVideoId,
-    includeAudio,
-    maxHeight
-  });
-
-  if (!resolvedVideo || !resolvedVideo.selectedStream?.url) {
-    return jsonResponse({
-      error: "OfficialVideoNotFound",
-      message: "Could not locate an official video stream for this track."
-    }, 404);
-  }
-
-  const rawVideoUrl = resolvedVideo.selectedStream.url;
-  const workerProxyStreamUrl = `${url.origin}/stream?url=${encodeURIComponent(rawVideoUrl)}`;
-  const directVideoStreamEndpoint = `${url.origin}/video?${new URLSearchParams({
-    ...(songId ? { id: songId } : {}),
-    videoId: resolvedVideo.videoId,
-    ...(title ? { title } : {}),
-    ...(artist ? { artist } : {}),
-    ...(durationSec ? { duration: String(durationSec) } : {}),
-    mode: "stream"
-  }).toString()}`;
-
-  const companionAudioProxyUrl = resolvedVideo.companionAudioStream?.url
-    ? `${url.origin}/stream?url=${encodeURIComponent(resolvedVideo.companionAudioStream.url)}`
-    : null;
-
-  if (shouldReturnJson) {
-    return jsonResponse({
-      ...resolvedVideo,
-      url: directVideoStreamEndpoint,
-      streamUrl: directVideoStreamEndpoint,
-      directStreamUrl: workerProxyStreamUrl,
-      workerProxyStreamUrl,
-      rawUpstreamUrl: rawVideoUrl,
-      companionAudioUrl: companionAudioProxyUrl,
-      selectedStream: {
-        ...resolvedVideo.selectedStream,
-        url: workerProxyStreamUrl,
-        streamEndpointUrl: directVideoStreamEndpoint,
-        rawUrl: rawVideoUrl
-      },
-      muxedStream: resolvedVideo.muxedStream ? {
-        ...resolvedVideo.muxedStream,
-        url: `${url.origin}/stream?url=${encodeURIComponent(resolvedVideo.muxedStream.url)}`
-      } : null,
-      videoOnlyStream: resolvedVideo.videoOnlyStream ? {
-        ...resolvedVideo.videoOnlyStream,
-        url: `${url.origin}/stream?url=${encodeURIComponent(resolvedVideo.videoOnlyStream.url)}`
-      } : null,
-      availableVideoOnlyQualities: (resolvedVideo.availableVideoOnlyQualities || []).map(q => ({
-        ...q,
-        url: `${url.origin}/stream?url=${encodeURIComponent(q.url)}`,
-        rawUrl: q.url
-      }))
-    }, 200, {
-      "X-Video-Id": resolvedVideo.videoId,
-      "X-Video-Resolution": resolvedVideo.selectedStream.resolution,
-      "X-Video-Audio-Mode": resolvedVideo.selectedStream.videoOnly ? "VIDEO_ONLY_NO_AUDIO" : "MUXED",
-      "X-Video-Sync-Offset-Ms": String(resolvedVideo.syncMetadata?.estimatedVideoIntroOffsetMs || 0)
-    });
-  }
-
-  const candidateUrls = resolvedVideo.fallbackStreamUrls?.length > 0
-    ? resolvedVideo.fallbackStreamUrls
-    : [rawVideoUrl];
-
-  return await pipeMediaStreamWithFallback(request, candidateUrls, {
-    "X-Video-Id": resolvedVideo.videoId,
-    "X-Video-Resolution": resolvedVideo.selectedStream.resolution,
-    "X-Video-Codec": resolvedVideo.selectedStream.codec || "avc1",
-    "X-Video-Audio-Mode": resolvedVideo.selectedStream.videoOnly ? "VIDEO_ONLY_NO_AUDIO" : "MUXED",
-    "X-Video-Sync-Offset-Ms": String(resolvedVideo.syncMetadata?.estimatedVideoIntroOffsetMs || 0)
-  });
-}
-
-// ============================================================================
 // SPOTIFY EMBED SSR, PARTNER GRAPHQL & RECOMMENDATION ENGINE (10 SONGS / CALL)
 // ============================================================================
 
+/**
+ * Universal Spotify Embed Scraper (`playlist`, `album`, `artist`, `track`)
+ * Also extracts and caches Spotify's anonymous session token for Partner GraphQL queries.
+ */
 async function fetchSpotifyEmbedEntity(resourceType, resourceId, timeoutMs = 4200) {
   if (!resourceType || !resourceId) return null;
   const cleanId = String(resourceId).split("?")[0].split(":").pop().trim();
@@ -2776,6 +1273,7 @@ async function fetchSpotifyEmbedEntity(resourceType, resourceId, timeoutMs = 420
     const state = parsed?.props?.pageProps?.state || parsed?.state || {};
     const entity = state?.data?.entity || {};
 
+    // Cache anonymous accessToken from Spotify embed page for Partner GraphQL lookups
     const sessionToken = state?.settings?.session?.accessToken;
     if (sessionToken && typeof sessionToken === "string") {
       CACHED_SPOTIFY_ANON_TOKEN = sessionToken;
@@ -2805,17 +1303,9 @@ async function fetchSpotifyEmbedEntity(resourceType, resourceId, timeoutMs = 420
 
     for (const item of rawTracks) {
       if (!item || !item.title) continue;
-      const uriStr = String(item.uri || "");
-      if (uriStr && !uriStr.includes(":track:") && !uriStr.includes(":local:")) continue;
-
-      const uriParts = uriStr.split(":");
-      const spotifyId = uriParts.length >= 3 ? uriParts[2] : (item.id || "");
-      const cleanSubtitle = cleanText(String(item.subtitle || "").replace(/\u00a0/g, " "));
-
-      if (!spotifyId && cleanText(item.title) === title && (!cleanSubtitle || cleanSubtitle === subtitle)) {
-        continue;
-      }
-
+      const uriParts = String(item.uri || "").split(":");
+      const spotifyId = uriParts.length >= 3 ? uriParts[2] : "";
+      const cleanSubtitle = cleanText(String(item.subtitle || subtitle || "").replace(/\u00a0/g, " "));
       const itemImg = item.coverArt?.sources?.[0]?.url
         || item.image?.url
         || (resourceType === "album" ? coverImg : "");
@@ -2823,48 +1313,11 @@ async function fetchSpotifyEmbedEntity(resourceType, resourceId, timeoutMs = 420
       tracks.push({
         spotifyId,
         trackName: cleanText(item.title),
-        artistName: cleanSubtitle || (resourceType === "album" ? subtitle : "Artist"),
+        artistName: cleanSubtitle || subtitle || "Artist",
         collectionName: resourceType === "album" ? title : cleanText(item.title),
         durationSec: item.duration ? Math.round(Number(item.duration) / 1000) : 0,
         artworkUrl: itemImg || coverImg
       });
-    }
-
-    if (resourceType === "playlist" && CACHED_SPOTIFY_ANON_TOKEN && Date.now() < CACHED_SPOTIFY_TOKEN_EXP) {
-      try {
-        const webApiRes = await fetchWithTimeout(
-          `https://api.spotify.com/v1/playlists/${encodeURIComponent(cleanId)}/tracks?limit=100&market=IN`,
-          {
-            headers: {
-              "Authorization": `Bearer ${CACHED_SPOTIFY_ANON_TOKEN}`,
-              "User-Agent": SAAVN_HEADERS["User-Agent"]
-            }
-          },
-          2800
-        );
-        if (webApiRes.ok) {
-          const webData = await webApiRes.json();
-          if (Array.isArray(webData?.items) && webData.items.length > 0) {
-            const enrichedApiTracks = [];
-            for (const entry of webData.items) {
-              const tr = entry?.track;
-              if (!tr || tr.type !== "track" || !tr.name) continue;
-              enrichedApiTracks.push({
-                spotifyId: String(tr.id || ""),
-                trackName: cleanText(tr.name),
-                artistName: Array.isArray(tr.artists) ? tr.artists.map(a => cleanText(a.name)).filter(Boolean).join(", ") : "Artist",
-                collectionName: cleanText(tr.album?.name || tr.name),
-                durationSec: tr.duration_ms ? Math.round(tr.duration_ms / 1000) : 0,
-                artworkUrl: tr.album?.images?.[0]?.url || coverImg
-              });
-            }
-            if (enrichedApiTracks.length >= tracks.length) {
-              tracks.length = 0;
-              tracks.push(...enrichedApiTracks);
-            }
-          }
-        }
-      } catch {}
     }
 
     if (resourceType === "track" && tracks.length === 0 && title) {
@@ -2915,7 +1368,10 @@ async function fetchSpotifyEmbedPlaylist(playlistId, timeoutMs = 4000) {
   };
 }
 
-async function searchSpotifyCatalog(query, limit = 10, timeoutMs = 2800) {
+/**
+ * Searches Spotify's catalog via Paxsenix Spotify Search + Spotify Embed to find tracks & artists
+ */
+async function searchSpotifyCatalog(query, limit = 10, timeoutMs = 3400) {
   if (!query) return { tracks: [], artistIds: [] };
   try {
     const res = await fetchWithTimeout(
@@ -2932,8 +1388,7 @@ async function searchSpotifyCatalog(query, limit = 10, timeoutMs = 2800) {
     const tracks = [];
     const artistIds = [];
 
-    for (let idx = 0; idx < Math.min(list.length, limit); idx++) {
-      const item = list[idx];
+    for (const item of list.slice(0, limit)) {
       if (!item) continue;
       const spId = item.id || item.trackId || String(item.uri || "").split(":").pop() || "";
       const trackName = cleanText(item.name || item.title || item.trackName || "");
@@ -2955,7 +1410,6 @@ async function searchSpotifyCatalog(query, limit = 10, timeoutMs = 2800) {
 
       tracks.push({
         spotifyId: String(spId),
-        canonicalRank: idx + 1,
         trackName,
         artistName,
         collectionName: albumName,
@@ -2970,6 +1424,11 @@ async function searchSpotifyCatalog(query, limit = 10, timeoutMs = 2800) {
   }
 }
 
+/**
+ * 100% SPOTIFY-POWERED ADAPTIVE QUEUE RECOMMENDATION ENGINE (`/reco`)
+ * Recommends 10 songs at a time using Spotify Artist Top Tracks, Collaborator Top Tracks,
+ * Spotify Catalog Search, and the user's Adaptive Session Taste Profile (`CLIENT_TASTE_PROFILE_MEMO`).
+ */
 async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
   const rawPid = (url.searchParams.get("id") || url.searchParams.get("pid") || "").trim();
   const limit = Math.min(25, Math.max(1, parseInt(url.searchParams.get("limit") || "10", 10) || 10));
@@ -2982,6 +1441,7 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
   let seedSpotifyId = cleanText(url.searchParams.get("spotifyId") || (rawPid.startsWith("spotify:") ? rawPid.split(":").pop() : ""));
   let seedAllArtists = [];
 
+  // 1. Resolve seed song metadata from memo or JioSaavn / iTunes if only `id` was passed
   if (rawPid && SONG_META_MEMO.has(rawPid)) {
     const memo = SONG_META_MEMO.get(rawPid);
     if (!seedTitle) seedTitle = memo.title || "";
@@ -2991,7 +1451,7 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     if (Array.isArray(memo.allArtists)) seedAllArtists = memo.allArtists;
   } else if (rawPid && /^\d+$/.test(rawPid) && (!seedTitle || !seedArtist)) {
     try {
-      const sDetails = await fetchSaavnJson({ __call: "song.getDetails", pids: rawPid }, 2600);
+      const sDetails = await fetchSaavnJson({ __call: "song.getDetails", pids: rawPid }, 2800);
       const rawSong = sDetails?.[rawPid] || sDetails?.songs?.[0] || Object.values(sDetails || {})[0];
       if (rawSong) {
         const enriched = enrichSaavnSong(rawSong, url.origin, null, quality);
@@ -3006,7 +1466,7 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     try {
       const lRes = await fetchWithTimeout(`https://itunes.apple.com/lookup?id=${encodeURIComponent(appleId)}&country=in`, {
         headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
-      }, 2400);
+      }, 2500);
       if (lRes.ok) {
         const lj = await lRes.json();
         const hit = lj?.results?.[0];
@@ -3019,6 +1479,7 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     } catch {}
   }
 
+  // Record this seed track into the user's adaptive taste profile so future recommendations improve
   const clientProfile = getOrCreateClientProfile(request, url);
   if (seedTitle || rawPid) {
     recordClientTrackInteraction(request, url, {
@@ -3030,6 +1491,7 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     });
   }
 
+  // Build exclusion sets so we NEVER recommend the seed track or songs already played in this session
   const explicitExcludes = (url.searchParams.get("exclude") || url.searchParams.get("history") || "")
     .split(",")
     .map(s => s.trim())
@@ -3052,6 +1514,7 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     ? seedAllArtists
     : seedArtist.split(/[,&/|]/).map(cleanText).filter(Boolean);
 
+  // Blend seed track's artists (65%) with the user's learned top affinity artists (35%)
   const sessionAffinityArtists = getTopClientAffinityArtists(clientProfile, 4);
   const explicitHistoryArtists = (url.searchParams.get("artists") || "")
     .split(",")
@@ -3064,20 +1527,24 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     ...sessionAffinityArtists.slice(0, 2)
   ])].filter(a => a && !/^(unknown|muse|openmuse|spotify|apple)/i.test(a));
 
+  // 2. Query Spotify for the seed track, primary artists, and taste-profile artists concurrently
   const cleanSeedTitle = extractCoreTrackTitle(seedTitle) || seedTitle;
   const spotifySearchQueries = [];
   if (cleanSeedTitle && targetArtists[0]) {
     spotifySearchQueries.push(`${cleanSeedTitle} ${targetArtists[0]}`);
   }
-  for (const art of targetArtists.slice(0, 2)) {
+  for (const art of targetArtists.slice(0, 3)) {
     spotifySearchQueries.push(art);
   }
+  if (seedAlbum && !/^(openmuse|muse)$/i.test(seedAlbum) && seedAlbum.toLowerCase() !== cleanSeedTitle.toLowerCase()) {
+    spotifySearchQueries.push(`${seedAlbum} ${targetArtists[0] || ""}`.trim());
+  }
 
-  const uniqueSpQueries = [...new Set(spotifySearchQueries.filter(Boolean))].slice(0, 3);
+  const uniqueSpQueries = [...new Set(spotifySearchQueries.filter(Boolean))].slice(0, 4);
 
   const [seedTrackEmbed, ...spSearchSettled] = await Promise.all([
-    seedSpotifyId ? fetchSpotifyEmbedEntity("track", seedSpotifyId, 2800) : Promise.resolve(null),
-    ...uniqueSpQueries.map(q => searchSpotifyCatalog(q, 12, 2800))
+    seedSpotifyId ? fetchSpotifyEmbedEntity("track", seedSpotifyId, 3200) : Promise.resolve(null),
+    ...uniqueSpQueries.map(q => searchSpotifyCatalog(q, 12, 3400))
   ]);
 
   const discoveredSpotifyArtistIds = new Set();
@@ -3097,19 +1564,32 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     }
   }
 
-  const artistIdsToFetch = [...discoveredSpotifyArtistIds].slice(0, 2);
+  // If we didn't have `seedSpotifyId` initially, check if the first Spotify search hit matches our seed track and grab its Spotify Artist ID via Embed!
+  if (discoveredSpotifyArtistIds.size === 0 && rawSpotifyCandidates.length > 0 && rawSpotifyCandidates[0].spotifyId) {
+    const firstEmbed = await fetchSpotifyEmbedEntity("track", rawSpotifyCandidates[0].spotifyId, 2800);
+    if (firstEmbed?.artists?.length) {
+      for (const a of firstEmbed.artists) {
+        if (a.id) discoveredSpotifyArtistIds.add(a.id);
+      }
+    }
+  }
+
+  // 3. Fetch Spotify Artist Top Tracks (`open.spotify.com/embed/artist/{id}`) for up to 3 discovered Spotify Artist IDs!
+  const artistIdsToFetch = [...discoveredSpotifyArtistIds].slice(0, 3);
   if (artistIdsToFetch.length > 0) {
     const artistEmbeds = await Promise.allSettled(
-      artistIdsToFetch.map(aId => fetchSpotifyEmbedEntity("artist", aId, 3000))
+      artistIdsToFetch.map(aId => fetchSpotifyEmbedEntity("artist", aId, 3400))
     );
     for (const ae of artistEmbeds) {
       if (ae.status === "fulfilled" && ae.value?.tracks?.length) {
+        // Interleave Spotify Artist Top Tracks at the front of our recommendation pool
         rawSpotifyCandidates.unshift(...ae.value.tracks);
       }
     }
   }
 
-  if (rawSpotifyCandidates.length < limit + 4) {
+  // 4. If Spotify pool still needs more variety (e.g. cold start or regional indie song), pull from matching Spotify Editorial Playlist
+  if (rawSpotifyCandidates.length < limit + 6) {
     const langs = langParam.split(",").map(s => s.trim());
     let fallbackPlId = SPOTIFY_HOME_PLAYLISTS.india_top.id;
     if (langs.includes("malayalam")) fallbackPlId = SPOTIFY_HOME_PLAYLISTS.malayalam_hits.id;
@@ -3118,12 +1598,13 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     else if (langs.includes("telugu")) fallbackPlId = SPOTIFY_HOME_PLAYLISTS.telugu_hits.id;
     else if (langs.includes("punjabi")) fallbackPlId = SPOTIFY_HOME_PLAYLISTS.punjabi_hits.id;
 
-    const plEmbed = await fetchSpotifyEmbedPlaylist(fallbackPlId, 2800);
+    const plEmbed = await fetchSpotifyEmbedPlaylist(fallbackPlId, 3000);
     if (plEmbed?.tracks?.length) {
       rawSpotifyCandidates.push(...plEmbed.tracks);
     }
   }
 
+  // 5. Filter & Rank Spotify Candidates (Diversity + Artist Affinity + Never Repeat Played Songs)
   const selectedSpotifyTracks = [];
   const seenCandidateCores = new Set();
   const artistCountInSelection = {};
@@ -3141,18 +1622,21 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
     if (excludedTitleSigs.has(candCore) || excludedTitleSigs.has(fullSig)) continue;
     if (cand.spotifyId && excludedIds.has(`spotify:${cand.spotifyId}`)) continue;
 
+    // Ensure artist diversity in the 10-song recommendation batch (max 3 songs by the exact same primary artist unless pool is small)
     const artKey = candPrimaryArtist || "unknown";
     if ((artistCountInSelection[artKey] || 0) >= 3 && rawSpotifyCandidates.length > limit * 2) {
       continue;
     }
 
     seenCandidateCores.add(candCore);
-    artistCountInSelection[artKey] = (artistCountInSelection[artKey] || 1) + 1;
+    artistCountInSelection[artKey] = (artistCountInSelection[artKey] || 0) + 1;
     selectedSpotifyTracks.push(cand);
 
     if (selectedSpotifyTracks.length >= limit + 4) break;
   }
 
+  // 6. Bridge the selected Spotify recommendations to 320kbps JioSaavn audio streams + real 500x500 song artwork!
+  // Optimization: Check persistent 2-tier bridge cache first, and group remaining lookups by artist/query to save subrequests!
   const bridgedRecommendations = await bridgeCuratedTrackListEfficiently(
     selectedSpotifyTracks.slice(0, limit + 3),
     targetArtists,
@@ -3180,46 +1664,53 @@ async function fetchSpotifyAdaptiveRecommendations(request, url, ctx) {
   };
 }
 
+/**
+ * Bridges a list of Spotify/Apple curated tracks to JioSaavn 320kbps audio + real song artwork
+ * while minimizing subrequests via 2-tier Edge Cache + Grouped Artist Search + Batch PID Healing.
+ */
 async function bridgeCuratedTrackListEfficiently(curatedTracks, hintArtists = [], origin, preferredQuality = "320", ctx = null) {
   if (!Array.isArray(curatedTracks) || curatedTracks.length === 0) return [];
 
   const resolvedMap = new Map();
   const uncachedTracks = [];
 
-  for (let idx = 0; idx < curatedTracks.length; idx++) {
-    const item = curatedTracks[idx];
-    const core = normalizeTokenComparison(extractCoreTrackTitle(item.trackName || item.title || ""));
-    const primArt = normalizeTokenComparison(String(item.artistName || item.artist || "").split(/[,&]/)[0]);
-    const cacheKey = `bridge_v13_${core}_${primArt}`;
-    if (TRACK_BRIDGE_MEMO.has(cacheKey)) {
-      const cachedRaw = TRACK_BRIDGE_MEMO.get(cacheKey);
-      resolvedMap.set(idx, buildCuratedBridgedSongObject(item, cachedRaw, origin, preferredQuality));
-    } else {
-      uncachedTracks.push({ item, idx, cacheKey });
-    }
-  }
+  // Step 1: Check In-Memory & Edge Cache first (0 upstream subrequests for cached songs!)
+  await Promise.all(
+    curatedTracks.map(async (item, idx) => {
+      const core = normalizeTokenComparison(extractCoreTrackTitle(item.trackName || item.title || ""));
+      const primArt = normalizeTokenComparison(String(item.artistName || item.artist || "").split(/[,&]/)[0]);
+      const cacheKey = `bridge_v10_${core}_${primArt}`;
+      if (TRACK_BRIDGE_MEMO.has(cacheKey)) {
+        const cachedRaw = TRACK_BRIDGE_MEMO.get(cacheKey);
+        resolvedMap.set(idx, buildCuratedBridgedSongObject(item, cachedRaw, origin, preferredQuality));
+      } else {
+        uncachedTracks.push({ item, idx, cacheKey });
+      }
+    })
+  );
 
   if (uncachedTracks.length > 0) {
+    // Step 2: Group uncached tracks by artist AND run targeted searches (capped at max 12 concurrent searches to save subrequests)
     const searchQueries = new Set();
-    for (const a of hintArtists.slice(0, 2)) {
+    for (const a of hintArtists.slice(0, 3)) {
       if (a) searchQueries.add(a);
     }
-    for (const u of uncachedTracks.slice(0, 6)) {
+    for (const u of uncachedTracks.slice(0, 12)) {
       const cleanT = extractCoreTrackTitle(u.item.trackName || u.item.title || "");
       const firstArt = String(u.item.artistName || u.item.artist || "").split(/[,&]/)[0].trim();
       if (cleanT) searchQueries.add(`${cleanT} ${firstArt}`.trim());
     }
 
-    const uniqueQueries = [...searchQueries].slice(0, 5);
+    const uniqueQueries = [...searchQueries].slice(0, 12);
     const searchSettled = await Promise.allSettled(
       uniqueQueries.map(q =>
         fetchSaavnJson({
           __call: "search.getResults",
           api_version: "4",
-          n: "18",
+          n: "10",
           p: "1",
           q
-        }, 2800)
+        }, 3200)
       )
     );
 
@@ -3245,10 +1736,14 @@ async function bridgeCuratedTrackListEfficiently(curatedTracks, hintArtists = []
 }
 
 // ============================================================================
-// UPGRADED URL-TO-PLAYLIST IMPORTER ENGINE (`/import`)
+// COPY-PASTE SPOTIFY & APPLE MUSIC PLAYLIST / LINK IMPORTER ENGINE (`/import`)
 // ============================================================================
 
-async function getAppleMusicWebDeveloperToken(timeoutMs = 3400) {
+/**
+ * Extracts Apple Music's public web developer JWT token (`eyJhbGci...`) from `music.apple.com`
+ * so we can query `https://amp-api.music.apple.com/v1/catalog/{storefront}/playlists/{id}` for full 100+ track playlists!
+ */
+async function getAppleMusicWebDeveloperToken(timeoutMs = 3800) {
   if (CACHED_APPLE_WEB_TOKEN && Date.now() < CACHED_APPLE_TOKEN_EXP) {
     return CACHED_APPLE_WEB_TOKEN;
   }
@@ -3262,6 +1757,7 @@ async function getAppleMusicWebDeveloperToken(timeoutMs = 3400) {
     if (!res.ok) return null;
     const html = await res.text();
 
+    // Check meta tag `desktop-music-app/config/environment` first
     const metaMatch = html.match(/<meta\s+name="desktop-music-app\/config\/environment"\s+content="([^"]+)"/i);
     if (metaMatch && metaMatch[1]) {
       const decoded = decodeURIComponent(metaMatch[1]);
@@ -3273,6 +1769,7 @@ async function getAppleMusicWebDeveloperToken(timeoutMs = 3400) {
       }
     }
 
+    // Fallback: Check JS bundle on music.apple.com
     const scriptMatch = html.match(/src="(\/assets\/index[^"]+\.js)"/i);
     if (scriptMatch && scriptMatch[1]) {
       const jsRes = await fetchWithTimeout(`https://music.apple.com${scriptMatch[1]}`, {
@@ -3292,6 +1789,11 @@ async function getAppleMusicWebDeveloperToken(timeoutMs = 3400) {
   return null;
 }
 
+/**
+ * Extracts all tracks & metadata from an Apple Music Playlist URL
+ * (`https://music.apple.com/{storefront}/playlist/{slug}/{pl.id}`)
+ * using BOTH `<script id="serialized-server-data">` SSR JSON and Apple's AMP Catalog API!
+ */
 async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in") {
   let cleanStorefront = storefront || "in";
   let playlistId = appleUrlOrId;
@@ -3315,28 +1817,15 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
   const extractedTracks = [];
   const seenKeys = new Set();
 
-  const isPlaylistHeaderEcho = (trackName, artistName, adamId) => {
-    const normT = normalizeTokenComparison(trackName);
-    const normPlTitle = normalizeTokenComparison(playlistTitle);
-    const normA = normalizeTokenComparison(artistName);
-    const normPlArt = normalizeTokenComparison(playlistArtist);
-
-    if (!/^\d+$/.test(String(adamId || ""))) {
-      if (normT && normPlTitle && normT === normPlTitle) return true;
-      if (normA && normPlArt && normT === normPlTitle && normA === normPlArt) return true;
-    }
-    return false;
-  };
-
   const pushTrack = (t) => {
     if (!t || !t.trackName) return;
-    if (isPlaylistHeaderEcho(t.trackName, t.artistName, t.appleId)) return;
     const k = `${t.appleId || ""}__${normalizeTokenComparison(t.trackName)}__${normalizeTokenComparison(t.artistName)}`;
     if (seenKeys.has(k)) return;
     seenKeys.add(k);
     extractedTracks.push(t);
   };
 
+  // Strategy 1: Fetch Apple Music Webpage & Parse `<script type="application/json" id="serialized-server-data">`
   try {
     const res = await fetchWithTimeout(pageUrl, {
       headers: {
@@ -3344,11 +1833,12 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9"
       }
-    }, 4500);
+    }, 5000);
 
     if (res.ok) {
       const html = await res.text();
 
+      // Also grab developer JWT if present in this page's HTML!
       const metaJwt = html.match(/eyJhbGciOiJFUzI1NiIsImtpZCI6I[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
       if (metaJwt && metaJwt[0]) {
         CACHED_APPLE_WEB_TOKEN = metaJwt[0];
@@ -3360,60 +1850,41 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
         const rawJson = JSON.parse(serializedMatch[1].trim());
         const rootData = Array.isArray(rawJson) ? rawJson[0]?.data : (rawJson?.data?.[0]?.data || rawJson?.data || rawJson);
 
+        // Extract header metadata
         const seo = rootData?.seoData;
         if (seo) {
-          playlistTitle = cleanText(
-            (seo.appleTitle || seo.pageTitle || playlistTitle)
-              .replace(/\s+by\s+.*?\s+on\s+Apple\s+Music.*$/i, "")
-              .replace(/\s*-\s*Apple\s+Music.*$/i, "")
-          );
+          playlistTitle = cleanText(seo.appleTitle || seo.pageTitle || playlistTitle);
           playlistImage = upgradeImage(seo.artworkUrl || "");
-        }
-
-        const sections = Array.isArray(rootData?.sections) ? rootData.sections : [];
-
-        for (const sec of sections) {
-          if (sec?.itemKind === "containerDetailHeaderLockup" || String(sec?.id || "").includes("header")) {
-            const hdr = sec?.items?.[0];
-            if (hdr) {
-              if (hdr.title) playlistTitle = cleanText(hdr.title);
-              const curator = cleanText(hdr.subtitleLinks?.[0]?.title || hdr.UpperSubtitleLinks?.[0]?.title || "");
-              if (curator) playlistArtist = curator;
-              const hdrArt = hdr.artwork?.dictionary?.url;
-              if (hdrArt) playlistImage = upgradeImage(hdrArt);
+          if (Array.isArray(seo.ogSongs)) {
+            for (const og of seo.ogSongs) {
+              const attr = og?.attributes || og;
+              if (attr?.name) {
+                pushTrack({
+                  appleId: String(og?.id || attr?.playParams?.id || ""),
+                  trackName: cleanText(attr.name),
+                  artistName: cleanText(attr.artistName || ""),
+                  collectionName: cleanText(attr.albumName || playlistTitle),
+                  durationSec: attr.durationInMillis ? Math.round(attr.durationInMillis / 1000) : 0,
+                  artworkUrl: upgradeImage(attr.artwork?.url || playlistImage)
+                });
+              }
             }
           }
         }
 
+        // Deeply walk sections for `trackLockup` items (which contain full playlist tracks!)
+        const sections = Array.isArray(rootData?.sections) ? rootData.sections : [];
         for (const sec of sections) {
-          if (
-            sec?.itemKind === "containerDetailHeaderLockup" ||
-            String(sec?.id || "").includes("header") ||
-            String(sec?.id || "").includes("footer")
-          ) {
-            continue;
+          if (sec?.itemKind === "containerDetailHeaderLockup" && sec?.items?.[0]) {
+            const hdr = sec.items[0];
+            playlistTitle = cleanText(hdr.title || playlistTitle);
+            playlistArtist = cleanText(hdr.subtitleLinks?.[0]?.title || hdr.UpperSubtitleLinks?.[0]?.title || playlistArtist);
+            const hdrArt = hdr.artwork?.dictionary?.url;
+            if (hdrArt) playlistImage = upgradeImage(hdrArt);
           }
 
           if (Array.isArray(sec?.items)) {
             for (const item of sec.items) {
-              if (!item || item.itemKind === "containerDetailHeaderLockup") continue;
-
-              const descriptorKind = item?.contentDescriptor?.kind || "";
-              if (descriptorKind && descriptorKind !== "song" && descriptorKind !== "musicVideo") {
-                continue;
-              }
-
-              const rawStoreAdamId = item?.contentDescriptor?.identifiers?.storeAdamID
-                || (String(item?.id || "").startsWith("track-lockup-") ? String(item.id).replace(/^track-lockup-/, "") : "");
-              const numericAdamId = /^\d+$/.test(String(rawStoreAdamId)) ? String(rawStoreAdamId) : "";
-
-              const isTrackLockup = item?.itemKind === "trackLockup"
-                || sec?.itemKind === "trackLockup"
-                || descriptorKind === "song"
-                || Boolean(numericAdamId);
-
-              if (!isTrackLockup) continue;
-
               const title = cleanText(item?.title || item?.trackName || "");
               const artist = cleanText(
                 item?.artistName ||
@@ -3426,12 +1897,15 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
                 item?.tertiaryLinks?.[0]?.title ||
                 playlistTitle
               );
+              const adamId = item?.contentDescriptor?.identifiers?.storeAdamID
+                || item?.id?.replace(/^track-lockup-/, "")
+                || "";
               const artUrl = upgradeImage(item?.artwork?.dictionary?.url || playlistImage);
               const durSec = item?.duration ? Math.round(Number(item.duration) / 1000) : 0;
 
-              if (title && artist) {
+              if (title && artist && (item?.itemKind === "trackLockup" || String(item?.id || "").includes("track") || adamId)) {
                 pushTrack({
-                  appleId: numericAdamId,
+                  appleId: /^\d+$/.test(String(adamId)) ? String(adamId) : "",
                   trackName: title,
                   artistName: artist,
                   collectionName: album,
@@ -3442,29 +1916,13 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
             }
           }
         }
-
-        if (extractedTracks.length === 0 && Array.isArray(seo?.ogSongs)) {
-          for (const og of seo.ogSongs) {
-            const attr = og?.attributes || og;
-            const ogId = String(og?.id || attr?.playParams?.id || "");
-            if (attr?.name && attr?.artistName) {
-              pushTrack({
-                appleId: /^\d+$/.test(ogId) ? ogId : "",
-                trackName: cleanText(attr.name),
-                artistName: cleanText(attr.artistName),
-                collectionName: cleanText(attr.albumName || playlistTitle),
-                durationSec: attr.durationInMillis ? Math.round(attr.durationInMillis / 1000) : 0,
-                artworkUrl: upgradeImage(attr.artwork?.url || playlistImage)
-              });
-            }
-          }
-        }
       }
     }
   } catch {}
 
+  // Strategy 2: Use Apple's AMP Web API (`amp-api.music.apple.com`) if we have or can get the web developer token
   if (extractedTracks.length < 5) {
-    const devToken = await getAppleMusicWebDeveloperToken(3000);
+    const devToken = await getAppleMusicWebDeveloperToken(3200);
     if (devToken) {
       try {
         const ampUrl = `https://amp-api.music.apple.com/v1/catalog/${cleanStorefront}/playlists/${encodeURIComponent(playlistId)}?include=tracks`;
@@ -3475,7 +1933,7 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
             "Referer": "https://music.apple.com/",
             "User-Agent": SAAVN_HEADERS["User-Agent"]
           }
-        }, 3800);
+        }, 4200);
         if (ampRes.ok) {
           const ampData = await ampRes.json();
           const plObj = ampData?.data?.[0];
@@ -3485,7 +1943,6 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
             playlistImage = upgradeImage(plObj.attributes?.artwork?.url || playlistImage);
             const trackData = plObj.relationships?.tracks?.data || [];
             for (const tr of trackData) {
-              if (tr?.type && tr.type !== "songs" && tr.type !== "music-videos") continue;
               const attr = tr?.attributes;
               if (!attr?.name) continue;
               pushTrack({
@@ -3513,125 +1970,14 @@ async function extractAppleMusicPlaylistFromUrl(appleUrlOrId, storefront = "in")
   };
 }
 
-async function extractYouTubePlaylistFromUrl(urlOrListId) {
-  let listId = String(urlOrListId).trim();
-  const match = listId.match(/[?&]list=([A-Za-z0-9_-]+)/);
-  if (match) listId = match[1];
-
-  try {
-    const browseId = listId.startsWith("VL") ? listId : `VL${listId}`;
-    const res = await fetchWithTimeout(
-      "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": SAAVN_HEADERS["User-Agent"]
-        },
-        body: JSON.stringify({
-          context: {
-            client: {
-              clientName: "WEB",
-              clientVersion: "2.20250312.04.00",
-              hl: "en",
-              gl: "IN"
-            }
-          },
-          browseId
-        })
-      },
-      3400
-    );
-    if (res.ok) {
-      const data = await res.json();
-      const plTitle = cleanText(
-        data?.header?.playlistHeaderRenderer?.title?.simpleText ||
-        data?.metadata?.playlistMetadataRenderer?.title ||
-        "YouTube Music Playlist"
-      );
-      const plAuthor = cleanText(
-        data?.header?.playlistHeaderRenderer?.ownerText?.runs?.[0]?.text ||
-        "YouTube Music"
-      );
-      const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
-      const secContents = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
-      const plItems = secContents[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents || [];
-
-      const tracks = [];
-      for (const item of plItems) {
-        const pvr = item?.playlistVideoRenderer;
-        if (!pvr || !pvr.videoId) continue;
-        const title = (pvr.title?.runs || []).map(r => r.text).join("") || pvr.title?.simpleText || "";
-        const author = (pvr.shortBylineText?.runs || []).map(r => r.text).join("").replace(/\s*-\s*Topic$/i, "");
-        const durSec = parseInt(pvr.lengthSeconds || "0", 10) || parseDurationTextToSec(pvr.lengthText?.simpleText || "");
-        const thumbs = pvr.thumbnail?.thumbnails || [];
-        const art = thumbs.length > 0 ? thumbs[thumbs.length - 1].url : `https://i.ytimg.com/vi/${pvr.videoId}/hqdefault.jpg`;
-        if (title) {
-          tracks.push({
-            ytVideoId: pvr.videoId,
-            trackName: cleanText(title),
-            artistName: cleanText(author || "Artist"),
-            collectionName: plTitle,
-            durationSec: durSec,
-            artworkUrl: upgradeImage(art)
-          });
-        }
-      }
-
-      if (tracks.length > 0) {
-        return {
-          id: `ytm:playlist:${listId}`,
-          sourcePlatform: "YouTubeMusic",
-          title: plTitle,
-          artist: plAuthor,
-          image: tracks[0]?.artworkUrl || "",
-          tracks
-        };
-      }
-    }
-  } catch {}
-
-  const pipedTasks = PIPED_API_INSTANCES.slice(0, 3).map(async (base) => {
-    const res = await fetchWithTimeout(
-      `${base}/playlists/${encodeURIComponent(listId)}`,
-      { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"], "Accept": "application/json" } },
-      3600
-    );
-    if (!res.ok) throw new Error("Piped playlist miss");
-    const data = await res.json();
-    const videos = Array.isArray(data?.relatedStreams) ? data.relatedStreams : [];
-    if (videos.length === 0) throw new Error("Empty YT playlist");
-    return {
-      id: `ytm:playlist:${listId}`,
-      sourcePlatform: "YouTubeMusic",
-      title: cleanText(data.name || "YouTube Music Playlist"),
-      artist: cleanText(data.uploader || "YouTube Music"),
-      image: upgradeImage(data.thumbnailUrl || videos[0]?.thumbnail || ""),
-      tracks: videos.map(v => ({
-        ytVideoId: extractYoutubeVideoId(v.url || v.id),
-        trackName: cleanText(v.title || ""),
-        artistName: cleanText(String(v.uploaderName || "").replace(/\s*-\s*topic$/i, "")),
-        collectionName: cleanText(data.name || "YouTube Music"),
-        durationSec: Number(v.duration || 0),
-        artworkUrl: upgradeImage(v.thumbnail || "")
-      })).filter(t => t.trackName)
-    };
-  });
-
-  try {
-    return await Promise.any(pipedTasks);
-  } catch {
-    return {
-      id: `ytm:playlist:${listId}`,
-      sourcePlatform: "YouTubeMusic",
-      title: "YouTube Music Playlist",
-      artist: "YouTube Music",
-      image: "",
-      tracks: []
-    };
-  }
-}
-
+/**
+ * Universal Copy-Paste Playlist & Link Importer (`handleUniversalPlaylistImport`)
+ * Supports:
+ * - Spotify Playlists, Albums, Artists, Tracks, and `spotify.link` short URLs
+ * - Apple Music Playlists (`pl....`), Albums, and Songs
+ * - JioSaavn Playlists and Albums
+ * - Plain-text song lists (`Artist - Title` per line)
+ */
 async function handleUniversalPlaylistImport(request, url, ctx) {
   let inputUrlOrText = (
     url.searchParams.get("url") ||
@@ -3641,7 +1987,6 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
     ""
   ).trim();
 
-  let customPlaylistName = cleanText(url.searchParams.get("name") || url.searchParams.get("playlistName") || url.searchParams.get("title") || "");
   let offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
   let batchSize = Math.min(50, Math.max(5, parseInt(url.searchParams.get("batchSize") || url.searchParams.get("limit") || "25", 10) || 25));
   const resolveAudioMode = (url.searchParams.get("resolveAudio") || "true").toLowerCase();
@@ -3653,9 +1998,6 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
       if (body?.url || body?.link || body?.text || body?.playlistUrl) {
         inputUrlOrText = String(body.url || body.link || body.playlistUrl || body.text).trim();
       }
-      if (body?.name || body?.playlistName || body?.title) {
-        customPlaylistName = cleanText(body.name || body.playlistName || body.title);
-      }
       if (typeof body?.offset === "number") offset = Math.max(0, body.offset);
       if (typeof body?.batchSize === "number") batchSize = Math.min(50, Math.max(5, body.batchSize));
     } catch {}
@@ -3664,31 +2006,18 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
   if (!inputUrlOrText) {
     return jsonResponse({
       error: "MissingPlaylistUrl",
-      message: "Pass ?url=<Spotify_AppleMusic_YouTubeMusic_or_JioSaavn_Playlist_URL> or POST JSON { url: '...' }"
+      message: "Pass ?url=<Spotify_or_AppleMusic_Playlist_URL> or POST JSON { url: '...' }"
     }, 400);
   }
 
-  const embeddedUrlMatch = inputUrlOrText.match(/https?:\/\/(?:open\.spotify\.com|spotify\.link|spoti\.fi|music\.apple\.com|apple\.co|(?:music\.|www\.)?youtube\.com|youtu\.be|(?:www\.)?jiosaavn\.com)\/[^\s"')<>]+/i);
-  if (embeddedUrlMatch) {
-    if (!customPlaylistName && inputUrlOrText.includes("\n")) {
-      const nonUrlLines = inputUrlOrText
-        .split(/\r?\n/)
-        .map(l => l.replace(/https?:\/\/\S+/gi, "").trim())
-        .filter(l => l.length >= 2 && !/^(?:listen\s+to|check\s+out|shared\s+from)/i.test(l));
-      if (nonUrlLines.length === 1) {
-        customPlaylistName = cleanText(nonUrlLines[0]);
-      }
-    }
-    inputUrlOrText = embeddedUrlMatch[0].trim();
-  }
-
+  // 1. Follow short links (`spotify.link`, `spoti.fi`, `apple.co`, `bit.ly`)
   if (/^https?:\/\/(?:spotify\.link|spoti\.fi|apple\.co)\//i.test(inputUrlOrText)) {
     try {
       const redirRes = await fetchWithTimeout(inputUrlOrText, {
         method: "GET",
         redirect: "follow",
         headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
-      }, 3200);
+      }, 3500);
       if (redirRes.url) {
         inputUrlOrText = redirRes.url;
       }
@@ -3698,35 +2027,38 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
   let extractedMeta = {
     id: `imported:${Date.now()}`,
     sourcePlatform: "Custom",
-    title: customPlaylistName || "Imported Playlist",
+    title: "Imported Playlist",
     artist: "Muse Importer",
     image: "",
     tracks: []
   };
 
+  // CASE A: Spotify URL or URI (`open.spotify.com/...` or `spotify:playlist:...`)
   const spotifyMatch = inputUrlOrText.match(/(?:open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album|artist|track)\/|spotify:(playlist|album|artist|track):)([A-Za-z0-9]+)/i);
   if (spotifyMatch) {
     const resourceType = (spotifyMatch[1] || spotifyMatch[2]).toLowerCase();
     const resourceId = spotifyMatch[3];
-    const spEntity = await fetchSpotifyEmbedEntity(resourceType, resourceId, 4500);
+    const spEntity = await fetchSpotifyEmbedEntity(resourceType, resourceId, 4800);
     if (spEntity) {
       extractedMeta = {
         id: spEntity.id,
         sourcePlatform: "Spotify",
-        title: customPlaylistName || spEntity.title,
+        title: spEntity.title,
         artist: spEntity.artist,
         image: spEntity.image,
         tracks: spEntity.tracks
       };
     }
-  } else if (/music\.apple\.com\//i.test(inputUrlOrText) || /^pl\.[a-z0-9-]+$/i.test(inputUrlOrText)) {
+  }
+  // CASE B: Apple Music URL (`music.apple.com/...`)
+  else if (/music\.apple\.com\//i.test(inputUrlOrText) || /^pl\.[a-z0-9-]+$/i.test(inputUrlOrText)) {
     const amPlaylistMatch = inputUrlOrText.match(/music\.apple\.com\/([a-z]{2})\/playlist\/(?:[^/]+\/)?(pl\.[a-zA-Z0-9.-]+)/i)
       || (inputUrlOrText.startsWith("pl.") ? [null, "in", inputUrlOrText] : null);
 
     if (amPlaylistMatch) {
       extractedMeta = await extractAppleMusicPlaylistFromUrl(inputUrlOrText, amPlaylistMatch[1] || "in");
-      if (customPlaylistName) extractedMeta.title = customPlaylistName;
     } else {
+      // Apple Music Album or Single Track URL (`music.apple.com/in/album/.../1234567?i=890123`)
       const trackParamMatch = inputUrlOrText.match(/[?&]i=(\d+)/);
       const albumIdMatch = inputUrlOrText.match(/\/(?:album|song)\/(?:[^/]+\/)?(\d+)/i);
       const lookupId = trackParamMatch ? trackParamMatch[1] : (albumIdMatch ? albumIdMatch[1] : "");
@@ -3736,7 +2068,7 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
           status: "ok",
           sourcePlatform: "AppleMusic",
           id: albData.id,
-          title: customPlaylistName || albData.title,
+          title: albData.title,
           artist: albData.artist,
           image: albData.image,
           coverUrl: albData.coverUrl,
@@ -3749,16 +2081,15 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
         });
       }
     }
-  } else if (/(?:youtube\.com|youtu\.be)\/.*[?&]list=([A-Za-z0-9_-]+)/i.test(inputUrlOrText)) {
-    extractedMeta = await extractYouTubePlaylistFromUrl(inputUrlOrText);
-    if (customPlaylistName) extractedMeta.title = customPlaylistName;
-  } else if (/jiosaavn\.com\//i.test(inputUrlOrText)) {
+  }
+  // CASE C: JioSaavn Playlist or Album URL
+  else if (/jiosaavn\.com\//i.test(inputUrlOrText)) {
     const albData = await resolveCompleteAlbum(inputUrlOrText, url.origin, quality);
     return jsonResponse({
       status: "ok",
       sourcePlatform: "JioSaavn",
       id: albData.id,
-      title: customPlaylistName || albData.title,
+      title: albData.title,
       artist: albData.artist,
       image: albData.image,
       coverUrl: albData.coverUrl,
@@ -3769,71 +2100,39 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
       songs: albData.songs,
       tracks: albData.songs
     });
-  } else if (inputUrlOrText.includes("\n")) {
-    const rawLines = inputUrlOrText
+  }
+  // CASE D: Plain Text Tracklist (`Artist - Song Title` on each line)
+  else if (inputUrlOrText.includes("\n")) {
+    const lines = inputUrlOrText
       .split(/\r?\n/)
-      .map(l => l.trim())
-      .filter(l => l.length >= 2 && !/^https?:\/\//i.test(l));
-
-    const linesWithSeparator = rawLines.filter(l => /\s+[-–—:]\s+/.test(l));
-    let startIdx = 0;
-    if (rawLines.length >= 2) {
-      const firstLine = rawLines[0];
-      if (
-        /^(?:playlist|title|name)\s*[:\-–—]/i.test(firstLine) ||
-        (customPlaylistName && normalizeTokenComparison(firstLine) === normalizeTokenComparison(customPlaylistName)) ||
-        (!/\s+[-–—:]\s+/.test(firstLine) && linesWithSeparator.length >= Math.floor((rawLines.length - 1) * 0.7))
-      ) {
-        if (!customPlaylistName) {
-          customPlaylistName = cleanText(firstLine.replace(/^(?:playlist|title|name)\s*[:\-–—]\s*/i, ""));
-          extractedMeta.title = customPlaylistName || extractedMeta.title;
-        }
-        startIdx = 1;
-      }
-    }
-
-    for (const rawLine of rawLines.slice(startIdx, startIdx + 100)) {
-      const line = rawLine.replace(/^\d+[\s.)\-]+/, "").trim();
-      if (!line) continue;
-      if (customPlaylistName && normalizeTokenComparison(line) === normalizeTokenComparison(customPlaylistName)) {
-        continue;
-      }
+      .map(l => l.replace(/^\d+[\s.)\-]+/, "").trim())
+      .filter(l => l.length >= 3);
+    for (const line of lines.slice(0, 100)) {
       const parts = line.split(/\s*[-–—:]\s*/);
       const trackName = parts.length > 1 ? parts.slice(1).join(" - ") : parts[0];
       const artistName = parts.length > 1 ? parts[0] : "";
       extractedMeta.tracks.push({
         trackName: cleanText(trackName),
         artistName: cleanText(artistName),
-        collectionName: extractedMeta.title,
+        collectionName: "Imported Playlist",
         durationSec: 0,
         artworkUrl: ""
       });
     }
   }
 
-  const plTitleNorm = normalizeTokenComparison(extractedMeta.title);
-  const plArtistNorm = normalizeTokenComparison(extractedMeta.artist);
-  const allRawTracks = (extractedMeta.tracks || []).filter((t, idx) => {
-    if (!t || !t.trackName) return false;
-    if (idx === 0 && !t.appleId && !t.spotifyId && !t.ytVideoId) {
-      const tNorm = normalizeTokenComparison(t.trackName);
-      const aNorm = normalizeTokenComparison(t.artistName || "");
-      if (tNorm === plTitleNorm && (!aNorm || aNorm === plArtistNorm || aNorm === "apple music" || aNorm === "spotify")) {
-        return false;
-      }
-    }
-    return true;
-  });
-
+  const allRawTracks = extractedMeta.tracks || [];
   const totalTracks = allRawTracks.length;
 
   if (totalTracks === 0) {
     return jsonResponse({
       error: "PlaylistEmptyOrPrivate",
-      message: "Could not extract tracks from the provided link. Make sure the Spotify, Apple Music, or YouTube Music playlist is public."
+      message: "Could not extract tracks from the provided link. Make sure the Spotify or Apple Music playlist is public."
     }, 404);
   }
 
+  // Eagerly resolve a batch of `batchSize` tracks starting at `offset` to direct 320kbps JioSaavn streams,
+  // while also returning the remaining tracks as instant lazy-bridged song objects so the user gets 100% of their playlist immediately!
   const eagerSlice = resolveAudioMode === "lazy"
     ? []
     : allRawTracks.slice(offset, offset + batchSize);
@@ -3847,7 +2146,7 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
     }
     const core = normalizeTokenComparison(extractCoreTrackTitle(rawItem.trackName || ""));
     const primArt = normalizeTokenComparison(String(rawItem.artistName || "").split(/[,&]/)[0]);
-    const cacheKey = `bridge_v13_${core}_${primArt}`;
+    const cacheKey = `bridge_v10_${core}_${primArt}`;
     const cachedMatch = TRACK_BRIDGE_MEMO.get(cacheKey) || null;
     return buildCuratedBridgedSongObject(rawItem, cachedMatch, url.origin, quality);
   });
@@ -3878,7 +2177,7 @@ async function handleUniversalPlaylistImport(request, url, ctx) {
 // SPOTIFY + APPLE MUSIC CURATED HOMEPAGE ENGINE (`/home`)
 // ============================================================================
 
-async function fetchSpotifyPublicChartsService(timeoutMs = 2600) {
+async function fetchSpotifyPublicChartsService(timeoutMs = 3000) {
   try {
     const res = await fetchWithTimeout("https://charts-spotify-com-service.spotify.com/public/v0/charts", {
       headers: {
@@ -3913,11 +2212,12 @@ async function fetchSpotifyPublicChartsService(timeoutMs = 2600) {
   }
 }
 
-async function fetchAppleMusicCharts(timeoutMs = 3000) {
+async function fetchAppleMusicCharts(timeoutMs = 3500) {
   const urls = [
     "https://rss.marketingtools.apple.com/api/v2/in/music/most-played/40/songs.json",
     "https://rss.marketingtools.apple.com/api/v2/us/music/most-played/25/songs.json",
-    "https://rss.marketingtools.apple.com/api/v2/in/music/most-played/20/albums.json"
+    "https://rss.marketingtools.apple.com/api/v2/in/music/most-played/20/albums.json",
+    "https://itunes.apple.com/in/rss/topsongs/limit=35/json"
   ];
 
   const settled = await Promise.allSettled(
@@ -3962,9 +2262,39 @@ async function fetchAppleMusicCharts(timeoutMs = 3000) {
     }
   }
 
+  if (settled[3].status === "fulfilled" && Array.isArray(settled[3].value?.feed?.entry)) {
+    for (const entry of settled[3].value.feed.entry) {
+      const appleId = entry?.id?.attributes?.["im:id"] || "";
+      const trackName = entry?.["im:name"]?.label || "";
+      const artistName = entry?.["im:artist"]?.label || "";
+      const collectionName = entry?.["im:collection"]?.["im:name"]?.label || trackName;
+      const images = Array.isArray(entry?.["im:image"]) ? entry["im:image"] : [];
+      const artworkUrl100 = images.length > 0 ? images[images.length - 1]?.label : "";
+      const durationMs = parseInt(entry?.link?.[1]?.attributes?.["im:duration"] || "0", 10) || 0;
+      if (appleId && trackName) {
+        songs.push({
+          appleId: String(appleId),
+          trackId: String(appleId),
+          trackName: cleanText(trackName),
+          artistName: cleanText(artistName),
+          collectionName: cleanText(collectionName),
+          trackTimeMillis: durationMs,
+          artworkUrl100
+        });
+      }
+    }
+  }
+
   return { songs, albums };
 }
 
+/**
+ * Upgraded Homepage Feed Engine:
+ * - Respects single-language chips strictly (e.g., `lang=malayalam` returns pure Malayalam Spotify & Apple/Saavn hits!)
+ * - Replaces generic Spotify playlist banners with real 500x500 song artwork
+ * - Blends personalized tracks based on the user's `CLIENT_TASTE_PROFILE_MEMO`
+ * - Returns both flat `songs` / `albums` (for current HTML) AND structured `shelves` (for richer homepage views)
+ */
 async function fetchSpotifyAndAppleHomeFeed(langParam, origin, request = null, url = null, ctx = null) {
   const quality = resolveRequestedAudioQuality(request, url);
   const langs = String(langParam || "english,hindi,malayalam,tamil,telugu")
@@ -3999,7 +2329,7 @@ async function fetchSpotifyAndAppleHomeFeed(langParam, origin, request = null, u
     );
   }
 
-  const uniquePlaylists = [...new Map(playlistsToFetch.map(p => [p.id, p])).values()].slice(0, 4);
+  const uniquePlaylists = [...new Map(playlistsToFetch.map(p => [p.id, p])).values()].slice(0, 5);
 
   const [
     spotifyPlaylistsSettled,
@@ -4007,17 +2337,17 @@ async function fetchSpotifyAndAppleHomeFeed(langParam, origin, request = null, u
     appleCharts,
     regionalSaavnTop
   ] = await Promise.all([
-    Promise.allSettled(uniquePlaylists.map(p => fetchSpotifyEmbedPlaylist(p.id, 3200))),
-    isSingleLangMode && singleLang !== "english" ? Promise.resolve([]) : fetchSpotifyPublicChartsService(2400),
-    isSingleLangMode ? Promise.resolve({ songs: [], albums: [] }) : fetchAppleMusicCharts(3000),
+    Promise.allSettled(uniquePlaylists.map(p => fetchSpotifyEmbedPlaylist(p.id, 3600))),
+    isSingleLangMode && singleLang !== "english" ? Promise.resolve([]) : fetchSpotifyPublicChartsService(2800),
+    isSingleLangMode ? Promise.resolve({ songs: [], albums: [] }) : fetchAppleMusicCharts(3500),
     isSingleLangMode
       ? fetchSaavnJson({
           __call: "search.getResults",
           api_version: "4",
-          n: "25",
+          n: "28",
           p: "1",
           q: `${singleLang} top hits 2026`
-        }, 3000).catch(() => null)
+        }, 3400).catch(() => null)
       : Promise.resolve(null)
   ]);
 
@@ -4103,7 +2433,7 @@ async function fetchSpotifyAndAppleHomeFeed(langParam, origin, request = null, u
     if (uniqueCuratedCandidates.length >= 36) break;
   }
 
-  const hintArtists = [...new Set(uniqueCuratedCandidates.slice(0, 8).map(t => String(t.artistName || "").split(/[,&]/)[0].trim()).filter(Boolean))];
+  const hintArtists = [...new Set(uniqueCuratedCandidates.slice(0, 10).map(t => String(t.artistName || "").split(/[,&]/)[0].trim()).filter(Boolean))];
   const enrichedHomeSongs = await bridgeCuratedTrackListEfficiently(
     uniqueCuratedCandidates,
     hintArtists,
@@ -4161,7 +2491,8 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
   const cleanId = String(albumIdOrToken || "").trim();
   if (!cleanId) throw new Error("Missing album ID");
 
-  if (/^https?:\/\/(?:open\.spotify\.com|spotify\.link|music\.apple\.com|(?:music\.|www\.)?youtube\.com)\//i.test(cleanId)) {
+  // 1. Support full Spotify or Apple Music URLs passed directly to `/album?id=...`
+  if (/^https?:\/\/(?:open\.spotify\.com|spotify\.link|music\.apple\.com)\//i.test(cleanId)) {
     const fakeReq = new Request(`${origin}/import?url=${encodeURIComponent(cleanId)}&quality=${preferredQuality}`);
     const impRes = await handleUniversalPlaylistImport(fakeReq, new URL(fakeReq.url), null);
     const impData = await impRes.json();
@@ -4186,14 +2517,15 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
     }
   }
 
+  // 2. Support Spotify Bridged Playlists / Albums (`spotify:37i9dQ...` or `spotify:playlist:37i9dQ...`)
   if (cleanId.startsWith("spotify:")) {
     const parts = cleanId.split(":");
     const resourceType = parts.length >= 3 ? parts[1] : "playlist";
     const spId = parts[parts.length - 1];
-    const plData = await fetchSpotifyEmbedEntity(resourceType, spId, 4000);
+    const plData = await fetchSpotifyEmbedEntity(resourceType, spId, 4200);
     if (plData && plData.tracks.length > 0) {
       const topTracks = plData.tracks.slice(0, 32);
-      const hintArtists = [...new Set(topTracks.slice(0, 6).map(t => String(t.artistName || "").split(/[,&]/)[0].trim()).filter(Boolean))];
+      const hintArtists = [...new Set(topTracks.slice(0, 8).map(t => String(t.artistName || "").split(/[,&]/)[0].trim()).filter(Boolean))];
       const enrichedSongs = await bridgeCuratedTrackListEfficiently(topTracks, hintArtists, origin, preferredQuality);
       const hiImg = upgradeImage(plData.image || enrichedSongs[0]?.image || "");
       return {
@@ -4216,6 +2548,7 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
     }
   }
 
+  // 3. Support Apple Music Bridged Albums & Playlists (`apple:12345678` or `apple:playlist:pl...`)
   if (cleanId.startsWith("apple:")) {
     const appleColId = cleanId.replace(/^apple:(?:playlist:)?/, "");
     if (appleColId.startsWith("pl.")) {
@@ -4243,7 +2576,7 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
     try {
       const res = await fetchWithTimeout(`https://itunes.apple.com/lookup?id=${encodeURIComponent(appleColId)}&entity=song&country=in`, {
         headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
-      }, 3600);
+      }, 4000);
       if (res.ok) {
         const data = await res.json();
         const results = Array.isArray(data?.results) ? data.results : [];
@@ -4260,7 +2593,7 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
             n: "30",
             p: "1",
             q: `${albumTitle} ${artistName}`
-          }, 3000);
+          });
           saavnPool = await batchHealMissingMediaUrls(sSearch?.results || []);
         } catch {}
 
@@ -4304,7 +2637,7 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
           api_version: "4",
           token,
           type
-        }, 3200);
+        });
         if (tokenData && (Array.isArray(tokenData.list) || Array.isArray(tokenData.songs))) {
           albumPayload = tokenData;
           rawTrackList = tokenData.list || tokenData.songs || [];
@@ -4320,7 +2653,7 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
         __call: "content.getAlbumDetails",
         api_version: "4",
         albumid: cleanId
-      }, 3200);
+      });
       if (v4Data && (Array.isArray(v4Data.list) || Array.isArray(v4Data.songs))) {
         albumPayload = v4Data;
         rawTrackList = v4Data.list || v4Data.songs || [];
@@ -4334,7 +2667,7 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
         __call: "playlist.getDetails",
         api_version: "4",
         listid: cleanId
-      }, 3200);
+      });
       if (plData && (Array.isArray(plData.list) || Array.isArray(plData.songs))) {
         albumPayload = plData;
         rawTrackList = plData.list || plData.songs || [];
@@ -4351,6 +2684,20 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
     healedTracks.map(s => enrichSaavnSong(s, origin, null, preferredQuality)).filter(s => s && s.id)
   );
 
+  let relatedAlbums = [];
+  if (isNumeric) {
+    try {
+      const recoRes = await fetchSaavnJson({
+        __call: "reco.getAlbumReco",
+        api_version: "4",
+        albumid: cleanId
+      });
+      if (Array.isArray(recoRes)) {
+        relatedAlbums = recoRes.slice(0, 8).map(a => enrichSaavnAlbum(a, origin));
+      }
+    } catch {}
+  }
+
   const normalizedAlbum = enrichSaavnAlbum(albumPayload, origin);
 
   return {
@@ -4358,14 +2705,23 @@ async function resolveCompleteAlbum(albumIdOrToken, origin, preferredQuality = "
     song_count: enrichedSongs.length,
     songs: enrichedSongs,
     list: enrichedSongs,
-    relatedAlbums: []
+    relatedAlbums
   };
 }
 
 // ============================================================================
-// SPOTIFY + APPLE + YOUTUBE MUSIC + JIOSAAVN HYBRID SEARCH ENGINE (`/search`)
+// INTELLIGENT 3-WAY HYBRID SEARCH & RELEVANCE SCORING ENGINE (`/search` & `/suggest`)
 // ============================================================================
 
+/**
+ * Multi-Factor Relevance Scorer for `/search`
+ * Ranks songs by:
+ * 1. Exact/Fuzzy Title Match
+ * 2. Movie / Album Name Match (e.g., searching "Aavesham" or "Manjummel Boys" boosts songs from that movie!)
+ * 3. Primary & Featured Artist Match
+ * 4. Variant Intent Match (Original Studio vs Remix/Lo-Fi/Slowed)
+ * 5. Direct 320kbps Availability + User Taste Profile Affinity
+ */
 function scoreSearchResultRelevance(song, rawQuery, queryVariantIntent, clientProfile = null) {
   if (!song || !song.title) return -999;
 
@@ -4373,8 +2729,6 @@ function scoreSearchResultRelevance(song, rawQuery, queryVariantIntent, clientPr
   const qWords = qNorm.split(" ").filter(Boolean);
   if (qWords.length === 0) return 0;
 
-  const rawTitleLower = String(song.title || "").toLowerCase();
-  const rawAlbumLower = String(song.album || "").toLowerCase();
   const titleCore = normalizeTokenComparison(extractCoreTrackTitle(song.title) || song.title);
   const titleFull = normalizeTokenComparison(song.title);
   const albumNorm = normalizeTokenComparison(song.album || "");
@@ -4383,82 +2737,71 @@ function scoreSearchResultRelevance(song, rawQuery, queryVariantIntent, clientPr
 
   let score = 0;
 
-  if (song.canonicalRank && song.canonicalRank <= 10) {
-    score += Math.max(40, 175 - (song.canonicalRank - 1) * 18);
-  }
-
-  const playCount = Number(song.play_count || song.more_info?.play_count || 0);
-  if (playCount >= 50_000_000) score += 110;
-  else if (playCount >= 10_000_000) score += 95;
-  else if (playCount >= 1_000_000) score += 75;
-  else if (playCount >= 200_000) score += 50;
-  else if (playCount >= 50_000) score += 28;
-  else if (playCount > 0 && playCount < 2500 && !song.canonicalRank) {
-    score -= 65;
-  }
-
-  const sim = computeStringSimilarity(titleCore, qNorm);
+  // 1. Title Similarity
   if (titleCore === qNorm || titleFull === qNorm) {
-    score += 150;
-  } else if (sim >= 0.88) {
-    score += 140;
+    score += 180;
   } else if (titleCore.startsWith(qNorm)) {
-    score += 125;
+    score += 145;
   } else if (titleCore.includes(qNorm) || qNorm.includes(titleCore)) {
-    score += 105;
-  } else if (sim >= 0.68) {
-    score += Math.round(sim * 115);
-  }
-
-  if (albumNorm && albumNorm !== "openmuse") {
-    if (albumNorm === qNorm) {
-      score += 140;
-    } else if (albumNorm.includes(qNorm) || qNorm.includes(albumNorm)) {
-      score += 110;
-    } else {
-      const albSim = computeStringSimilarity(albumNorm, qNorm);
-      if (albSim >= 0.78) score += Math.round(albSim * 95);
+    score += 115;
+  } else {
+    const sim = computeStringSimilarity(titleCore, qNorm);
+    if (sim >= 0.72) {
+      score += Math.round(sim * 125);
     }
   }
 
+  // 2. Movie / Soundtrack / Album Match (Crucial for Indian & Film Music searches!)
+  if (albumNorm && albumNorm !== "openmuse") {
+    if (albumNorm === qNorm) {
+      score += 155;
+    } else if (albumNorm.includes(qNorm) || qNorm.includes(albumNorm)) {
+      score += 120;
+    } else {
+      const albSim = computeStringSimilarity(albumNorm, qNorm);
+      if (albSim >= 0.78) score += Math.round(albSim * 100);
+    }
+  }
+
+  // 3. Artist Match
   if (artistNorm) {
     if (artistNorm === qNorm || artistNorm.includes(qNorm)) {
-      score += 125;
+      score += 130;
     } else {
       const matchedArtistWords = qWords.filter(w => w.length >= 3 && artistNorm.includes(w));
       score += matchedArtistWords.length * 42;
     }
   }
 
+  // 4. Token Coverage Across Title + Album + Artist
   const matchedTokens = qWords.filter(w => combinedNorm.includes(w));
   if (matchedTokens.length === qWords.length) {
-    score += 75;
+    score += 95;
   } else {
-    score += (matchedTokens.length / qWords.length) * 45;
+    score += (matchedTokens.length / qWords.length) * 60;
   }
 
-  const isCoverOrFanMade = /\b(cover|fan\s*made|tribute|rendition|style\s+of|karaoke|instrumental|8d|ringtone|dj\s+[a-z]+)\b/i.test(`${rawTitleLower} ${rawAlbumLower}`);
-  if (isCoverOrFanMade && !/\b(cover|tribute|karaoke|instrumental|8d|dj)\b/i.test(rawQuery)) {
-    score -= 180;
-  }
-
+  // 5. Variant Intent Alignment (Don't bury original studio tracks under random DJ remixes unless user searched "remix"/"lofi")
   const songVariant = song.variant || extractTrackVariantTag(song.title, song.album);
   if (queryVariantIntent === "standard") {
     if (songVariant === "standard") {
       score += 65;
     } else {
-      score -= 65;
+      score -= 45;
     }
   } else if (songVariant.includes(queryVariantIntent)) {
     score += 110;
   }
 
+  // 6. Direct 320kbps Stream Readiness Boost
   if (song.decrypted_media_url && String(song.decrypted_media_url).includes("saavncdn.com")) {
-    score += 35;
-  } else if (song.ytVideoId) {
-    score += 35;
+    score += 40;
+  }
+  if (song.spotifyId || song.appleId) {
+    score += 25;
   }
 
+  // 7. Personalization Boost from User's Adaptive Taste Profile
   if (clientProfile && clientProfile.artistScores) {
     for (const [favArtist, weight] of Object.entries(clientProfile.artistScores)) {
       const normFav = normalizeTokenComparison(favArtist);
@@ -4477,7 +2820,8 @@ async function executeIntelligentHybridSearch(query, origin, request = null, url
   const quality = resolveRequestedAudioQuality(request, url);
   const clientProfile = request && url ? getOrCreateClientProfile(request, url) : null;
 
-  if (/^https?:\/\/(?:open\.spotify\.com|spotify\.link|spoti\.fi|music\.apple\.com|(?:music\.|www\.)?youtube\.com)\//i.test(q) || /^spotify:(playlist|album|track|artist):/i.test(q)) {
+  // Auto-detect if user pasted a Spotify or Apple Music URL directly into the search bar!
+  if (/^https?:\/\/(?:open\.spotify\.com|spotify\.link|spoti\.fi|music\.apple\.com)\//i.test(q) || /^spotify:(playlist|album|track|artist):/i.test(q)) {
     const fakeReq = new Request(`${origin}/import?url=${encodeURIComponent(q)}&quality=${quality}`);
     const impRes = await handleUniversalPlaylistImport(fakeReq, new URL(fakeReq.url), ctx);
     const impData = await impRes.json();
@@ -4514,25 +2858,27 @@ async function executeIntelligentHybridSearch(query, origin, request = null, url
 
   const queryVariantIntent = extractTrackVariantTag(q, "");
 
-  // Fire 6 parallel requests including Direct YouTube Music (`WEB_REMIX`) & Direct YouTube (`WEB`)
+  // Run 4-way parallel search: Spotify Catalog + Apple iTunes Songs + Apple iTunes Albums + JioSaavn Songs & Albums
   const [
     spotifyRes,
     itunesSongsRes,
-    ytMusicDirectRes,
-    ytWebDirectRes,
+    itunesAlbumsRes,
     saavnSongsRes,
     saavnAlbumsRes
   ] = await Promise.allSettled([
-    searchSpotifyCatalog(q, 12, 2600),
+    searchSpotifyCatalog(q, 14, 3200),
     fetchWithTimeout(
-      `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&country=in&media=music&entity=song&limit=15`,
+      `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&country=in&media=music&entity=song&limit=18`,
       { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-      2600
+      3200
     ).then(r => r.ok ? r.json() : null),
-    searchYouTubeMusicDirectInnertube(q, 2600),
-    searchYouTubeDirectInnertube(`${q} song`, 2600),
-    fetchSaavnJson({ __call: "search.getResults", api_version: "4", n: "30", p: "1", q }, 3200),
-    fetchSaavnJson({ __call: "search.getAlbumResults", api_version: "4", n: "12", p: "1", q }, 3000)
+    fetchWithTimeout(
+      `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&country=in&media=music&entity=album&limit=10`,
+      { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
+      3200
+    ).then(r => r.ok ? r.json() : null),
+    fetchSaavnJson({ __call: "search.getResults", api_version: "4", n: "35", p: "1", q }, 4000),
+    fetchSaavnJson({ __call: "search.getAlbumResults", api_version: "4", n: "16", p: "1", q }, 4000)
   ]);
 
   const spotifySongHits = (spotifyRes.status === "fulfilled" && Array.isArray(spotifyRes.value?.tracks))
@@ -4540,58 +2886,52 @@ async function executeIntelligentHybridSearch(query, origin, request = null, url
     : [];
 
   const appleSongHits = (itunesSongsRes.status === "fulfilled" && Array.isArray(itunesSongsRes.value?.results))
-    ? itunesSongsRes.value.results.map((r, idx) => ({ ...r, canonicalRank: idx + 1 }))
+    ? itunesSongsRes.value.results
     : [];
-
-  const ytHits = [];
-  const seenYtSearchIds = new Set();
-  for (const src of [ytMusicDirectRes, ytWebDirectRes]) {
-    if (src.status === "fulfilled" && Array.isArray(src.value)) {
-      for (const item of src.value) {
-        if (item?.videoId && !seenYtSearchIds.has(item.videoId)) {
-          seenYtSearchIds.add(item.videoId);
-          ytHits.push(item);
-        }
-      }
-    }
-  }
 
   let saavnRawSongs = (saavnSongsRes.status === "fulfilled" && Array.isArray(saavnSongsRes.value?.results))
     ? saavnSongsRes.value.results
     : [];
 
-  const findBestYtHitForTrack = (titleStr, artistStr) => {
-    const normT = normalizeTokenComparison(extractCoreTrackTitle(titleStr) || titleStr);
-    const normA = normalizeTokenComparison(String(artistStr || "").split(/[,&]/)[0]);
-    for (const y of ytHits) {
-      if (y.isShort) continue;
-      const yT = normalizeTokenComparison(extractCoreTrackTitle(y.title) || y.title);
-      const ySim = computeStringSimilarity(yT, normT);
-      if (yT === normT || ySim >= 0.72 || yT.includes(normT) || normT.includes(yT)) {
-        return y;
-      }
-      if (normA && y.uploaderName.toLowerCase().includes(normA) && ySim >= 0.55) {
-        return y;
-      }
-    }
-    return null;
-  };
-
-  const topCanonical = spotifySongHits[0] || appleSongHits[0];
-  if (topCanonical) {
-    const canCore = extractCoreTrackTitle(topCanonical.trackName);
-    const canArt = String(topCanonical.artistName || "").split(/[,&]/)[0].trim();
-    if (canCore && normalizeTokenComparison(canCore) !== normalizeTokenComparison(q) && saavnRawSongs.length < 5) {
+  // Intelligent Spell-Correction / Autocorrect Healing:
+  // If user made a typo and JioSaavn returned few results, use Spotify or Apple Music's top canonical hit to query JioSaavn!
+  const topCanonicalHit = spotifySongHits[0] || appleSongHits[0];
+  if (topCanonicalHit && saavnRawSongs.length < 6) {
+    const correctedQ = `${extractCoreTrackTitle(topCanonicalHit.trackName)} ${String(topCanonicalHit.artistName || "").split(/[,&]/)[0]}`.trim();
+    if (correctedQ && normalizeTokenComparison(correctedQ) !== normalizeTokenComparison(q)) {
       try {
         const extraSaavn = await fetchSaavnJson({
           __call: "search.getResults",
           api_version: "4",
-          n: "15",
+          n: "24",
           p: "1",
-          q: `${canCore} ${canArt}`.trim()
-        }, 2200);
+          q: correctedQ
+        }, 2800);
         if (Array.isArray(extraSaavn?.results)) {
           saavnRawSongs.push(...extraSaavn.results);
+        }
+      } catch {}
+    }
+  }
+
+  // Also check if top JioSaavn Album matches the query (e.g. user searched a movie name like "Aavesham" or "Manjummel Boys")
+  const saavnRawAlbums = (saavnAlbumsRes.status === "fulfilled" && Array.isArray(saavnAlbumsRes.value?.results))
+    ? saavnAlbumsRes.value.results
+    : [];
+
+  if (saavnRawAlbums.length > 0) {
+    const topAlb = saavnRawAlbums[0];
+    const albTitleNorm = normalizeTokenComparison(topAlb.title || topAlb.name || "");
+    if (albTitleNorm && (albTitleNorm === normalizeTokenComparison(q) || computeStringSimilarity(albTitleNorm, q) >= 0.85)) {
+      try {
+        const albDetails = await fetchSaavnJson({
+          __call: "content.getAlbumDetails",
+          api_version: "4",
+          albumid: String(topAlb.id || topAlb.albumid)
+        }, 2600);
+        const albTracks = albDetails?.list || albDetails?.songs || [];
+        if (Array.isArray(albTracks) && albTracks.length > 0) {
+          saavnRawSongs.unshift(...albTracks);
         }
       } catch {}
     }
@@ -4604,111 +2944,51 @@ async function executeIntelligentHybridSearch(query, origin, request = null, url
 
   const combinedCandidates = [];
   const usedSaavnIds = new Set();
-  const usedYtIds = new Set();
 
-  for (let i = 0; i < spotifySongHits.length; i++) {
-    const spHit = spotifySongHits[i];
+  // 1. Bridge Spotify hits to JioSaavn 320kbps pool
+  for (const spHit of spotifySongHits) {
     if (!spHit || !spHit.trackName) continue;
     if (isLowQualityJunkTrack({ title: spHit.trackName, album: spHit.collectionName, duration: spHit.durationSec }, q)) continue;
     const matchedSaavn = findBestSaavnMatchForCuratedTrack(spHit, healedSaavnPool);
-    const matchedYt = findBestYtHitForTrack(spHit.trackName, spHit.artistName);
-    if (matchedYt) usedYtIds.add(matchedYt.videoId);
-
-    const enrichedInput = {
-      ...spHit,
-      canonicalRank: i + 1,
-      ytVideoId: matchedYt?.videoId || "",
-      playCount: matchedYt?.views || 0
-    };
-
     if (matchedSaavn) {
       usedSaavnIds.add(String(matchedSaavn.id));
-      combinedCandidates.push(buildCuratedBridgedSongObject(enrichedInput, matchedSaavn, origin, quality));
+      combinedCandidates.push(buildCuratedBridgedSongObject(spHit, matchedSaavn, origin, quality));
     } else {
-      combinedCandidates.push(buildCuratedBridgedSongObject(enrichedInput, null, origin, quality));
+      combinedCandidates.push(buildCuratedBridgedSongObject(spHit, null, origin, quality));
     }
   }
 
-  for (let i = 0; i < appleSongHits.length; i++) {
-    const appleHit = appleSongHits[i];
+  // 2. Bridge Apple Music / iTunes hits to JioSaavn 320kbps pool
+  for (const appleHit of appleSongHits) {
     if (!appleHit || !appleHit.trackId) continue;
     if (isLowQualityJunkTrack({ title: appleHit.trackName, album: appleHit.collectionName, duration: (appleHit.trackTimeMillis || 0) / 1000 }, q)) {
       continue;
     }
     const matchedSaavn = findBestSaavnMatchForCuratedTrack(appleHit, healedSaavnPool);
-    const matchedYt = findBestYtHitForTrack(appleHit.trackName, appleHit.artistName);
-    if (matchedYt) usedYtIds.add(matchedYt.videoId);
-
-    const enrichedInput = {
-      ...appleHit,
-      canonicalRank: i + 1,
-      ytVideoId: matchedYt?.videoId || "",
-      playCount: matchedYt?.views || 0
-    };
-
     if (matchedSaavn) {
       usedSaavnIds.add(String(matchedSaavn.id));
-      combinedCandidates.push(buildCuratedBridgedSongObject(enrichedInput, matchedSaavn, origin, quality));
+      combinedCandidates.push(buildCuratedBridgedSongObject(appleHit, matchedSaavn, origin, quality));
     } else {
-      combinedCandidates.push(buildCuratedBridgedSongObject(enrichedInput, null, origin, quality));
+      combinedCandidates.push(buildCuratedBridgedSongObject(appleHit, null, origin, quality));
     }
   }
 
-  for (let i = 0; i < Math.min(ytHits.length, 8); i++) {
-    const y = ytHits[i];
-    if (!y || !y.videoId || y.isShort || usedYtIds.has(y.videoId)) continue;
-    if (y.duration > 600 || (y.duration > 0 && y.duration < 45)) continue;
-    if (/\b(karaoke|ringtone|reaction|tutorial|interview|teaser|trailer)\b/i.test(y.title) && !/\b(karaoke|ringtone)\b/i.test(q)) {
-      continue;
-    }
-
-    const cleanYtTitle = extractCoreTrackTitle(y.title) || y.title;
-    const titleParts = cleanYtTitle.split(/\s*[-–—|]\s*/).filter(Boolean);
-    let parsedTrackName = cleanYtTitle;
-    let parsedArtistName = y.uploaderName.replace(/\s*-\s*Topic$/i, "").trim();
-
-    if (titleParts.length >= 2) {
-      parsedArtistName = titleParts[0].trim();
-      parsedTrackName = titleParts[1].trim();
-    }
-
-    const ytCuratedItem = {
-      ytVideoId: y.videoId,
-      canonicalRank: i + 1,
-      playCount: y.views || 0,
-      trackName: parsedTrackName,
-      artistName: parsedArtistName || y.uploaderName,
-      collectionName: parsedTrackName,
-      durationSec: y.duration || 0,
-      artworkUrl: y.thumbnail
-    };
-
-    const matchedSaavn = findBestSaavnMatchForCuratedTrack(ytCuratedItem, healedSaavnPool);
-    if (matchedSaavn) {
-      usedSaavnIds.add(String(matchedSaavn.id));
-    }
-    combinedCandidates.push(buildCuratedBridgedSongObject(ytCuratedItem, matchedSaavn, origin, quality));
-  }
-
+  // 3. Add remaining JioSaavn 320kbps songs
   for (const sRaw of healedSaavnPool) {
     if (!sRaw || !sRaw.id) continue;
     if (usedSaavnIds.has(String(sRaw.id))) continue;
-    const matchedYt = findBestYtHitForTrack(sRaw.title || sRaw.song || "", sRaw.primary_artists || sRaw.more_info?.primary_artists || "");
-    combinedCandidates.push(enrichSaavnSong(sRaw, origin, matchedYt ? { ytVideoId: matchedYt.videoId } : null, quality));
+    combinedCandidates.push(enrichSaavnSong(sRaw, origin, null, quality));
   }
 
+  // 4. Deduplicate and Rank by Multi-Factor Relevance Score!
   const deduplicatedSongs = deduplicateEnrichedSongs(combinedCandidates);
   const scoredSongs = deduplicatedSongs.map((song, idx) => ({
     song,
-    score: scoreSearchResultRelevance(song, q, queryVariantIntent, clientProfile) - idx * 0.4
+    score: scoreSearchResultRelevance(song, q, queryVariantIntent, clientProfile) - idx * 0.5
   }));
 
   scoredSongs.sort((a, b) => b.score - a.score);
   const finalSongs = scoredSongs.map(x => x.song).slice(0, 34);
-
-  const saavnRawAlbums = (saavnAlbumsRes.status === "fulfilled" && Array.isArray(saavnAlbumsRes.value?.results))
-    ? saavnAlbumsRes.value.results
-    : [];
 
   const finalAlbums = [];
   const seenAlbumKeys = new Set();
@@ -4722,6 +3002,33 @@ async function executeIntelligentHybridSearch(query, origin, request = null, url
     }
   }
 
+  if (itunesAlbumsRes.status === "fulfilled" && Array.isArray(itunesAlbumsRes.value?.results)) {
+    for (const col of itunesAlbumsRes.value.results) {
+      if (!col?.collectionId || !col?.collectionName) continue;
+      const cleanName = cleanText(col.collectionName);
+      const key = normalizeTokenComparison(cleanName);
+      if (key && !seenAlbumKeys.has(key)) {
+        seenAlbumKeys.add(key);
+        const hiImg = upgradeImage(col.artworkUrl100 || "");
+        const appleAlbId = `apple:${col.collectionId}`;
+        finalAlbums.push({
+          id: appleAlbId,
+          albumid: appleAlbId,
+          type: "album",
+          itemType: "album",
+          title: cleanName,
+          name: cleanName,
+          artist: cleanText(col.artistName || "Album"),
+          subtitle: cleanText(col.artistName || "Album"),
+          year: col.releaseDate ? String(col.releaseDate).slice(0, 4) : "",
+          image: hiImg,
+          coverUrl: proxyImg(hiImg, origin),
+          workerAlbumUrl: `${origin}/album?id=${encodeURIComponent(appleAlbId)}`
+        });
+      }
+    }
+  }
+
   return {
     query: q,
     audioQuality: `${quality}kbps`,
@@ -4730,6 +3037,9 @@ async function executeIntelligentHybridSearch(query, origin, request = null, url
   };
 }
 
+/**
+ * Spotify + Taste-Adaptive Search Suggestions & Autocomplete (`/suggest`)
+ */
 async function handleSearchSuggestions(request, url) {
   const q = (url.searchParams.get("q") || "").trim();
   const profile = getOrCreateClientProfile(request, url);
@@ -4751,11 +3061,11 @@ async function handleSearchSuggestions(request, url) {
   }
 
   const [spRes, itunesRes] = await Promise.allSettled([
-    searchSpotifyCatalog(q, 8, 2200),
+    searchSpotifyCatalog(q, 8, 2400),
     fetchWithTimeout(
       `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&country=in&media=music&entity=song&limit=6`,
       { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-      2200
+      2400
     ).then(r => r.ok ? r.json() : null)
   ]);
 
@@ -4785,7 +3095,8 @@ async function handleSearchSuggestions(request, url) {
 }
 
 // ============================================================================
-// REAL-TIME WORD-BY-WORD LYRICS ENGINE v13.0
+// REAL-TIME WORD-BY-WORD LYRICS ENGINE v10.0
+// (APPLE MUSIC HEAVY + 100% LRCLIB FORMAT + LRC.RED + UNISON/BETTERLYRICS + BILINGUAL)
 // ============================================================================
 
 function isCreditOrMetadataJunkLine(rawLine, trackTitle = "", artistName = "", lineIndex = 0, lineTimeSec = 0) {
@@ -4985,7 +3296,10 @@ function distributeWordsAcrossWindow(text, lineStartSec, vocalEndSec, lineHardEn
   const wordWeights = rawWords.map((w, idx) => estimateWordWeight(w, idx === n - 1));
   const pauseWeights = rawWords.map((w, idx) => getPostWordPauseRatio(w, idx === n - 1));
 
-  const totalUnits = Math.max(0.5, wordWeights.reduce((a, b) => a + b, 0) + pauseWeights.reduce((a, b) => a + b, 0));
+  const totalUnits = Math.max(
+    0.5,
+    wordWeights.reduce((a, b) => a + b, 0) + pauseWeights.reduce((a, b) => a + b, 0)
+  );
   const activeSpan = Math.max(0.22, vocalEndSec - lineStartSec);
 
   let cursor = lineStartSec;
@@ -5057,6 +3371,9 @@ function formatLrcTimestamp(sec) {
   return `${mm}:${ss}`;
 }
 
+/**
+ * Generates accurate LRCLIB Enhanced LRC (`[mm:ss.xx]<mm:ss.xx>word1 <mm:ss.xx>word2`)
+ */
 function buildEnhancedLrcFromTimeline(lines) {
   if (!Array.isArray(lines) || lines.length === 0) return "";
   return lines
@@ -5074,6 +3391,9 @@ function buildEnhancedLrcFromTimeline(lines) {
     .join("\n");
 }
 
+/**
+ * Generates 100% Standard LRCLIB `syncedLyrics` (`[mm:ss.xx] Line text`)
+ */
 function buildStandardLrcFromTimeline(lines, useNative = false) {
   if (!Array.isArray(lines) || lines.length === 0) return "";
   return lines
@@ -5106,20 +3426,6 @@ function buildLyricsPlusCompatiblePayload(lines) {
     }
     return item;
   });
-}
-
-function validateFetchedLyricsTimeline(lines, expectedDurationSec = 0) {
-  if (!Array.isArray(lines) || lines.length < 2) return false;
-  const vocalLines = lines.filter(l => l && !l.isInstrumental && cleanText(l.text));
-  if (vocalLines.length < 2) return false;
-
-  if (expectedDurationSec >= 90) {
-    const lastVocalLine = vocalLines[vocalLines.length - 1];
-    if (lastVocalLine.time > expectedDurationSec + 45) {
-      return false;
-    }
-  }
-  return true;
 }
 
 function finalizeTimelineMonotonic(rawEntries, totalDurationSec = 0, trackTitle = "", artistName = "") {
@@ -5476,28 +3782,6 @@ function parseLyricsPlusJsonToTimeline(data, totalDurationSec = 0, trackTitle = 
   const rawLyrics = data?.lyrics;
   if (!Array.isArray(rawLyrics) || rawLyrics.length === 0) return null;
 
-  const returnedTitle = cleanText(data?.metadata?.title || data?.title || "");
-  const returnedArtist = cleanText(data?.metadata?.artist || data?.artist || "");
-  if (returnedTitle && trackTitle) {
-    const tSim = computeStringSimilarity(extractCoreTrackTitle(returnedTitle) || returnedTitle, extractCoreTrackTitle(trackTitle) || trackTitle);
-    const normRet = normalizeTokenComparison(returnedTitle);
-    const normExp = normalizeTokenComparison(trackTitle);
-    if (tSim < 0.55 && !normRet.includes(normExp) && !normExp.includes(normRet)) {
-      return null;
-    }
-  }
-  if (returnedArtist && artistName) {
-    const normRetArt = normalizeTokenComparison(returnedArtist);
-    const expArtists = String(artistName).split(/[,&/|]/).map(a => normalizeTokenComparison(a)).filter(Boolean);
-    const artistOverlap = expArtists.some(ea => {
-      const words = ea.split(" ").filter(w => w.length >= 3);
-      return normRetArt.includes(ea) || ea.includes(normRetArt) || words.some(w => w.length >= 4 && normRetArt.includes(w));
-    });
-    if (!artistOverlap && expArtists.length > 0 && returnedTitle && normalizeTokenComparison(returnedTitle).length <= 8) {
-      return null;
-    }
-  }
-
   const maxRawTime = rawLyrics.reduce((m, l) => Math.max(m, Number(l?.time) || 0), 0);
   const toSec = (val) => {
     const n = Number(val) || 0;
@@ -5614,7 +3898,7 @@ function parseLyricsPlusJsonToTimeline(data, totalDurationSec = 0, trackTitle = 
   }
 
   const lines = finalizeTimelineMonotonic(entries, totalDurationSec, trackTitle, artistName);
-  if (!validateFetchedLyricsTimeline(lines, totalDurationSec)) return null;
+  if (lines.length === 0) return null;
 
   return {
     lines,
@@ -5821,6 +4105,10 @@ function parseTtmlToTimeline(ttmlXml, totalDurationSec = 0, trackTitle = "", art
   return finalizeTimelineMonotonic(entries, totalDurationSec, trackTitle, artistName);
 }
 
+/**
+ * Upgraded LRC & Enhanced LRC Parser:
+ * Supports `[mm:ss.xx]`, `[mm:ss.xxx]`, `[mm:ss:xx]`, `[mm:ss]`, multi-timestamps, and `<mm:ss.xx>` word tags!
+ */
 function parseLrcToTimeline(lrcString, totalDurationSec = 0, trackTitle = "", artistName = "") {
   if (!lrcString || typeof lrcString !== "string") return { lines: [], hasEnhancedWordTags: false };
 
@@ -6029,19 +4317,18 @@ function buildInstrumentalFallbackTimeline(trackTitle, artistName, totalDuration
   return finalizeTimelineMonotonic(entries, dur);
 }
 
+/**
+ * Upgraded Fuzzy Candidate Scorer for Apple Music, LRC.RED, Deezer, and LRCLIB
+ * Handles JioSaavn -> Apple Music / LRCLIB title & artist differences gracefully!
+ */
 function scoreLrcCandidate(item, tokens, durationSec, preferRomanScript = false) {
   if (!item || (!item.syncedLyrics && !item.plainLyrics)) return -999;
 
   const rawItemTitle = String(item.trackName || item.name || item.title || "").toLowerCase();
   const rawSearchTitle = String(tokens.primaryTitle || "").toLowerCase();
 
-  if (/\b(karaoke|8d|ringtone|tribute)\b/i.test(rawItemTitle) && !/\b(karaoke|8d|ringtone|tribute)\b/i.test(rawSearchTitle)) {
+  if (/\b(karaoke|8d|ringtone)\b/i.test(rawItemTitle) && !/\b(karaoke|8d|ringtone)\b/i.test(rawSearchTitle)) {
     return -500;
-  }
-
-  const itemVariant = extractTrackVariantTag(rawItemTitle, item.albumName || item.album || "");
-  if (tokens.variantTag === "standard" && itemVariant !== "standard") {
-    return -400;
   }
 
   const itemTitle = normalizeTokenComparison(extractCoreTrackTitle(item.trackName || item.name || item.title || "") || item.trackName || "");
@@ -6058,16 +4345,16 @@ function scoreLrcCandidate(item, tokens, durationSec, preferRomanScript = false)
     titleScore = 105;
   } else if (simPrimary >= 0.80) {
     titleScore = Math.round(simPrimary * 95);
-  } else if (targetTitle && (itemTitle.includes(targetTitle) || targetTitle.includes(itemTitle)) && Math.min(itemTitle.length, targetTitle.length) >= 4) {
+  } else if (targetTitle && (itemTitle.includes(targetTitle) || targetTitle.includes(itemTitle))) {
     titleScore = 82;
   } else if (altTitle && altTitle.length >= 3 && (itemTitle === altTitle || simAlt >= 0.82 || itemTitle.includes(altTitle))) {
     titleScore = 76;
   } else if (targetTitle) {
     const targetWords = targetTitle.split(" ").filter(w => w.length >= 3);
     const matchedWords = targetWords.filter(w => itemTitle.includes(w));
-    if (targetWords.length >= 2 && matchedWords.length === targetWords.length) {
+    if (targetWords.length > 0 && matchedWords.length === targetWords.length) {
       titleScore = 75;
-    } else if (targetWords.length >= 3 && matchedWords.length >= targetWords.length - 1) {
+    } else if (targetWords.length >= 2 && matchedWords.length >= targetWords.length - 1) {
       titleScore = 58;
     }
   }
@@ -6075,27 +4362,20 @@ function scoreLrcCandidate(item, tokens, durationSec, preferRomanScript = false)
   if (titleScore === 0) return -500;
 
   let score = titleScore;
-  let artistMatched = false;
-  let albumMatched = false;
-  let tightDurationMatch = false;
+  let contextMatched = false;
 
   for (const a of tokens.artists) {
     const normA = normalizeTokenComparison(a);
     if (!normA) continue;
     const words = normA.split(" ").filter(w => w.length >= 3);
-    if (
-      itemArtist.includes(normA) ||
-      normA.includes(itemArtist) ||
-      (words.length > 0 && words.every(w => itemArtist.includes(w))) ||
-      words.some(w => w.length >= 5 && itemArtist.includes(w))
-    ) {
-      score += 85;
-      artistMatched = true;
+    if (itemArtist.includes(normA) || normA.includes(itemArtist) || words.some(w => w.length >= 4 && itemArtist.includes(w))) {
+      score += 75;
+      contextMatched = true;
       break;
     }
-    if (itemAlbum && words.some(w => w.length >= 5 && itemAlbum.includes(w))) {
-      score += 55;
-      albumMatched = true;
+    if (itemAlbum && words.some(w => w.length >= 4 && itemAlbum.includes(w))) {
+      score += 50;
+      contextMatched = true;
       break;
     }
   }
@@ -6103,16 +4383,9 @@ function scoreLrcCandidate(item, tokens, durationSec, preferRomanScript = false)
   if (tokens.album) {
     const normAlb = normalizeTokenComparison(tokens.album);
     const albWords = normAlb.split(" ").filter(w => w.length >= 3);
-    if (
-      normAlb &&
-      normAlb !== targetTitle &&
-      (itemAlbum.includes(normAlb) ||
-       itemTitle.includes(normAlb) ||
-       itemArtist.includes(normAlb) ||
-       albWords.some(w => w.length >= 5 && (itemAlbum.includes(w) || itemArtist.includes(w))))
-    ) {
-      score += 75;
-      albumMatched = true;
+    if (normAlb && (itemAlbum.includes(normAlb) || itemTitle.includes(normAlb) || itemArtist.includes(normAlb) || albWords.some(w => w.length >= 4 && (itemAlbum.includes(w) || itemArtist.includes(w))))) {
+      score += 65;
+      contextMatched = true;
     }
   }
 
@@ -6121,38 +4394,28 @@ function scoreLrcCandidate(item, tokens, durationSec, preferRomanScript = false)
     const diff = Math.abs(durationSec - itemDur);
     if (diff <= 3) {
       score += 90;
-      tightDurationMatch = true;
+      contextMatched = true;
     } else if (diff <= 8) {
       score += 65;
-    } else if (diff <= 15) {
-      score += 25;
-    } else if (diff > 28) {
-      score -= 140;
+      contextMatched = true;
+    } else if (diff <= 18) {
+      score += 32;
+    } else if (diff > 50 && !contextMatched) {
+      score -= 40;
     }
   }
 
-  const hasKnownContext = tokens.artists.length > 0 || Boolean(tokens.album);
-  if (hasKnownContext && !artistMatched && !albumMatched) {
-    if (!tightDurationMatch) {
-      return -500;
-    }
-    if (targetTitle.split(" ").length <= 2) {
-      return -450;
-    }
-    score -= 60;
-  }
-
-  if (item.syncedLyrics && item.syncedLyrics !== "1") {
+  if (item.syncedLyrics) {
     if (/<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>/.test(item.syncedLyrics)) {
-      score += 95;
+      score += 145;
     } else {
-      score += 65;
+      score += 95;
     }
   } else if (item.plainLyrics) {
-    score += 20;
+    score += 25;
   }
 
-  if (preferRomanScript && (item.syncedLyrics || item.plainLyrics) && item.syncedLyrics !== "1") {
+  if (preferRomanScript) {
     const sampleText = String(item.syncedLyrics || item.plainLyrics || "")
       .replace(/\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/g, " ")
       .replace(/<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>/g, " ");
@@ -6160,15 +4423,20 @@ function scoreLrcCandidate(item, tokens, durationSec, preferRomanScript = false)
     const nonLatinCount = (sampleText.match(/[\u0900-\u0d7f\u4e00-\u9fff]/g) || []).length;
     if (latinCount + nonLatinCount > 20) {
       const ratio = latinCount / (latinCount + nonLatinCount);
-      if (ratio >= 0.70) score += 65;
+      if (ratio >= 0.70) score += 85;
     }
   }
 
   return score;
 }
 
+/**
+ * WORLD-CLASS 7-VECTOR TRACK IDENTITY RESOLVER (`resolveWorldClassTrackIdentity`)
+ * Accurately bridges any JioSaavn / Spotify / User song to its Apple Music Track IDs (`appleTrackIds`),
+ * Official ISRC (`isrc`), Spotify Track ID (`spotifyTrackId`), and Canonical Apple Metadata!
+ */
 async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitAppleId = "", explicitSpotifyId = "") {
-  const memoKey = `id_v13__${tokens.primaryTitle.toLowerCase()}__${(tokens.artists[0] || "").toLowerCase()}__${tokens.album.toLowerCase()}__${durationSec}`;
+  const memoKey = `${tokens.primaryTitle.toLowerCase()}__${(tokens.artists[0] || "").toLowerCase()}__${tokens.album.toLowerCase()}__${durationSec}`;
   if (TRACK_IDENTITY_MEMO.has(memoKey)) {
     return TRACK_IDENTITY_MEMO.get(memoKey);
   }
@@ -6176,43 +4444,60 @@ async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitApple
   const queries = [];
   if (tokens.primaryTitle && tokens.artists[0]) queries.push(`${tokens.primaryTitle} ${tokens.artists[0]}`);
   if (tokens.primaryTitle && tokens.album) queries.push(`${tokens.primaryTitle} ${tokens.album}`);
+  if (tokens.primaryTitle && tokens.artists[1]) queries.push(`${tokens.primaryTitle} ${tokens.artists[1]}`);
+  if (tokens.secondaryTitle && tokens.secondaryTitle.length >= 3) {
+    queries.push(`${tokens.secondaryTitle} ${tokens.artists[0] || tokens.album || ""}`.trim());
+  }
   if (tokens.primaryTitle) queries.push(tokens.primaryTitle);
 
-  const uniqueQueries = [...new Set(queries.filter(Boolean))].slice(0, 2);
+  const uniqueQueries = [...new Set(queries.filter(Boolean))].slice(0, 4);
   const primaryQ = uniqueQueries[0] || tokens.primaryTitle;
 
   const [
     explicitLookupRes,
     itunesSettled,
     paxsenixAppleSearchRes,
-    lrcRedSearchRes
+    lrcRedSearchRes,
+    deezerSearchRes
   ] = await Promise.all([
     (explicitAppleId && /^\d+$/.test(String(explicitAppleId)))
       ? fetchWithTimeout(
           `https://itunes.apple.com/lookup?id=${encodeURIComponent(explicitAppleId)}&country=in`,
           { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-          2400
+          2500
         ).then(r => (r.ok ? r.json() : null)).catch(() => null)
       : Promise.resolve(null),
 
-    Promise.allSettled(
-      uniqueQueries.map(q =>
+    Promise.allSettled([
+      ...uniqueQueries.slice(0, 3).map(q =>
         fetchWithTimeout(
           `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&country=in&media=music&entity=song&limit=8`,
           { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-          2400
+          2600
         ).then(r => (r.ok ? r.json() : null))
-      )
-    ),
+      ),
+      fetchWithTimeout(
+        `https://itunes.apple.com/search?term=${encodeURIComponent(primaryQ)}&country=us&media=music&entity=song&limit=6`,
+        { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
+        2600
+      ).then(r => (r.ok ? r.json() : null))
+    ]),
 
     fetchWithTimeout(
       `https://lyrics.paxsenix.org/apple-music/search?q=${encodeURIComponent(primaryQ)}`,
+      { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
+      2800
+    ).then(r => (r.ok ? r.json() : null)).catch(() => null),
+
+    // Vector: LRC.RED 30M+ Track & ISRC Index (`https://lrc.red/search.json?q=...`)
+    fetchWithTimeout(
+      `https://lrc.red/search.json?q=${encodeURIComponent(primaryQ)}`,
       { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
       2500
     ).then(r => (r.ok ? r.json() : null)).catch(() => null),
 
     fetchWithTimeout(
-      `https://lrc.red/search.json?q=${encodeURIComponent(primaryQ)}`,
+      `https://api.deezer.com/search?q=${encodeURIComponent(primaryQ)}&limit=5`,
       { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
       2400
     ).then(r => (r.ok ? r.json() : null)).catch(() => null)
@@ -6221,7 +4506,7 @@ async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitApple
   const appleCandidates = [];
   const seenAppleIds = new Set();
 
-  const pushAppleCand = (id, trackName, artistName, collectionName, durationMs, isrc = "", isExplicitId = false) => {
+  const pushAppleCand = (id, trackName, artistName, collectionName, durationMs, isrc = "") => {
     if (!id || !trackName || seenAppleIds.has(String(id))) return;
     seenAppleIds.add(String(id));
     appleCandidates.push({
@@ -6230,14 +4515,13 @@ async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitApple
       artistName: cleanText(artistName || ""),
       collectionName: cleanText(collectionName || ""),
       durationSec: durationMs ? Math.round(Number(durationMs) / 1000) : 0,
-      isrc: isrc || "",
-      isExplicitId
+      isrc: isrc || ""
     });
   };
 
   if (explicitLookupRes?.results?.[0]) {
     const r = explicitLookupRes.results[0];
-    pushAppleCand(r.trackId, r.trackName, r.artistName, r.collectionName, r.trackTimeMillis, "", true);
+    pushAppleCand(r.trackId, r.trackName, r.artistName, r.collectionName, r.trackTimeMillis);
   }
 
   for (const res of itunesSettled) {
@@ -6263,10 +4547,8 @@ async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitApple
 
   const scoredApple = [];
   for (const c of appleCandidates) {
-    if (c.isExplicitId) {
-      scoredApple.push({ cand: c, score: 500 });
-      continue;
-    }
+    const cVariant = extractTrackVariantTag(c.trackName, c.collectionName);
+    if (tokens.variantTag === "standard" && cVariant !== "standard") continue;
     const sc = scoreLrcCandidate(
       {
         trackName: c.trackName,
@@ -6279,7 +4561,7 @@ async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitApple
       durationSec,
       false
     );
-    if (sc >= 145) {
+    if (sc >= 48) {
       scoredApple.push({ cand: c, score: sc });
     }
   }
@@ -6302,29 +4584,58 @@ async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitApple
         durationSec,
         false
       );
-      if (sc >= 145 && hit.isrc) {
+      if (sc >= 50 && hit.isrc) {
         lrcRedIsrcs.push(String(hit.isrc));
         if (!resolvedIsrc) resolvedIsrc = String(hit.isrc);
       }
     }
   }
 
+  let deezerCanonical = null;
+  if (Array.isArray(deezerSearchRes?.data)) {
+    for (const dz of deezerSearchRes.data) {
+      const sc = scoreLrcCandidate(
+        {
+          trackName: dz.title_short || dz.title,
+          artistName: dz.artist?.name || "",
+          albumName: dz.album?.title || "",
+          duration: dz.duration || 0,
+          syncedLyrics: "1"
+        },
+        tokens,
+        durationSec,
+        false
+      );
+      if (sc >= 54) {
+        if (!resolvedIsrc && dz.isrc) resolvedIsrc = String(dz.isrc);
+        if (dz.isrc && !lrcRedIsrcs.includes(String(dz.isrc))) lrcRedIsrcs.push(String(dz.isrc));
+        deezerCanonical = {
+          title: cleanText(dz.title_short || dz.title || ""),
+          artist: cleanText(dz.artist?.name || ""),
+          album: cleanText(dz.album?.title || ""),
+          durationSec: dz.duration || durationSec
+        };
+        break;
+      }
+    }
+  }
+
   const bestApple = scoredApple[0]?.cand || null;
-  const allAppleIds = scoredApple.slice(0, 3).map(x => x.cand.trackId);
+  const allAppleIds = scoredApple.slice(0, 4).map(x => x.cand.trackId);
   if (explicitAppleId && !allAppleIds.includes(String(explicitAppleId))) {
     allAppleIds.unshift(String(explicitAppleId));
   }
 
   const cleanCanonicalTitle = bestApple
     ? (extractCoreTrackTitle(bestApple.trackName) || bestApple.trackName)
-    : tokens.primaryTitle;
+    : (deezerCanonical?.title || tokens.primaryTitle);
 
   const cleanCanonicalAlbum = bestApple
     ? bestApple.collectionName
         .replace(/\s*\((?:original\s+motion\s+picture\s+soundtrack|deluxe|special\s+edition).*?\)/gi, "")
         .replace(/\s*-\s*(?:Single|EP|Original Motion Picture Soundtrack)$/i, "")
         .trim()
-    : tokens.album;
+    : (deezerCanonical?.album || tokens.album);
 
   const identity = {
     appleTrackId: allAppleIds[0] || null,
@@ -6334,16 +4645,20 @@ async function resolveWorldClassTrackIdentity(tokens, durationSec, explicitApple
     isrcList: [...new Set([resolvedIsrc, ...lrcRedIsrcs].filter(Boolean))].slice(0, 3),
     canonicalTitle: cleanCanonicalTitle || tokens.primaryTitle,
     fullAppleTitle: bestApple?.trackName || cleanCanonicalTitle || tokens.primaryTitle,
-    canonicalArtist: bestApple?.artistName || tokens.artists[0] || "",
-    primaryAppleArtist: cleanText(String(bestApple?.artistName || tokens.artists[0] || "").split(/[,&]/)[0]),
+    canonicalArtist: bestApple?.artistName || deezerCanonical?.artist || tokens.artists[0] || "",
+    primaryAppleArtist: cleanText(String(bestApple?.artistName || deezerCanonical?.artist || tokens.artists[0] || "").split(/[,&]/)[0]),
     canonicalAlbum: cleanCanonicalAlbum || tokens.album,
-    canonicalDuration: bestApple?.durationSec || durationSec
+    canonicalDuration: bestApple?.durationSec || deezerCanonical?.durationSec || durationSec
   };
 
   setBoundedMemo(TRACK_IDENTITY_MEMO, memoKey, identity);
   return identity;
 }
 
+/**
+ * TIER 1A: Paxsenix Direct Apple Music Syllable & TTML Fetcher
+ * Races top 3 matched Apple Music Track IDs concurrently with a 5200ms live-lookup timeout!
+ */
 async function fetchPaxsenixAppleLyrics(identity, tokens, durationSec) {
   const appleIds = identity?.appleTrackIds || (identity?.appleTrackId ? [identity.appleTrackId] : []);
   if (appleIds.length === 0) return null;
@@ -6357,12 +4672,12 @@ async function fetchPaxsenixAppleLyrics(identity, tokens, durationSec) {
       fetchWithTimeout(
         `https://lyrics.paxsenix.org/apple-music/lyrics?id=${encodeURIComponent(appleId)}&ttml=true&v=2`,
         { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-        4500
+        5200
       ),
       fetchWithTimeout(
         `https://lyrics.paxsenix.org/apple-music/lyrics?id=${encodeURIComponent(appleId)}`,
         { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-        4500
+        5200
       )
     ]);
 
@@ -6370,7 +4685,7 @@ async function fetchPaxsenixAppleLyrics(identity, tokens, durationSec) {
       const rawTtml = await ttmlRes.value.text();
       if (rawTtml.includes("<p")) {
         const lines = parseTtmlToTimeline(rawTtml, dur, title, artist);
-        if (validateFetchedLyricsTimeline(lines, dur)) {
+        if (lines.length >= 2) {
           return { lines, source: "AppleMusicDirectTtmlProvider", syncType: "WORD" };
         }
       }
@@ -6379,13 +4694,13 @@ async function fetchPaxsenixAppleLyrics(identity, tokens, durationSec) {
         const xmlStr = parsedTtmlJson?.ttml || parsedTtmlJson?.data?.ttml || parsedTtmlJson?.content;
         if (typeof xmlStr === "string" && xmlStr.includes("<p")) {
           const lines = parseTtmlToTimeline(xmlStr, dur, title, artist);
-          if (validateFetchedLyricsTimeline(lines, dur)) {
+          if (lines.length >= 2) {
             return { lines, source: "AppleMusicDirectTtmlProvider", syncType: "WORD" };
           }
         }
         const sylLines = parsePaxsenixAppleJsonToTimeline(parsedTtmlJson, dur, title, artist);
-        if (validateFetchedLyricsTimeline(sylLines, dur)) {
-          return { lines, source: "AppleMusicDirectSyllableProvider", syncType: "WORD" };
+        if (sylLines.length >= 2) {
+          return { lines: sylLines, source: "AppleMusicDirectSyllableProvider", syncType: "WORD" };
         }
       } catch {}
     }
@@ -6394,14 +4709,14 @@ async function fetchPaxsenixAppleLyrics(identity, tokens, durationSec) {
       const rawText = await jsonRes.value.text();
       if (rawText.includes("<p")) {
         const lines = parseTtmlToTimeline(rawText, dur, title, artist);
-        if (validateFetchedLyricsTimeline(lines, dur)) {
+        if (lines.length >= 2) {
           return { lines, source: "AppleMusicDirectTtmlProvider", syncType: "WORD" };
         }
       }
       const parsedJson = JSON.parse(rawText);
       const sylLines = parsePaxsenixAppleJsonToTimeline(parsedJson, dur, title, artist);
-      if (validateFetchedLyricsTimeline(sylLines, dur)) {
-        return { lines, source: "AppleMusicDirectSyllableProvider", syncType: "WORD" };
+      if (sylLines.length >= 2) {
+        return { lines: sylLines, source: "AppleMusicDirectSyllableProvider", syncType: "WORD" };
       }
     }
 
@@ -6409,18 +4724,30 @@ async function fetchPaxsenixAppleLyrics(identity, tokens, durationSec) {
   };
 
   try {
-    return await Promise.any(appleIds.slice(0, 2).map(id => trySingleAppleId(id)));
+    return await Promise.any(appleIds.slice(0, 3).map(id => trySingleAppleId(id)));
   } catch {
     return null;
   }
 }
 
+/**
+ * TIER 1B: LyricsPlus / KPOE / LRCMUX Cluster (Queries both with and without album to prevent album-mismatch 404s)
+ */
 async function fetchLyricsPlusAppleCluster(identity, tokens, durationSec, sources = "apple,lyricsplus,musixmatch-word,musixmatch,spotify") {
   const queryTitle = identity?.canonicalTitle || tokens.primaryTitle;
   const queryArtist = identity?.primaryAppleArtist || tokens.artists[0] || "";
+  const queryAlbum = identity?.canonicalAlbum || tokens.album || "";
   const queryDur = durationSec || identity?.canonicalDuration || 0;
 
-  if (!queryTitle || !queryArtist) return null;
+  if (!queryTitle) return null;
+
+  const v2QsWithAlb = new URLSearchParams({
+    title: queryTitle,
+    artist: queryArtist,
+    album: queryAlbum,
+    duration: String(queryDur),
+    source: sources
+  });
 
   const v2QsNoAlb = new URLSearchParams({
     title: queryTitle,
@@ -6436,24 +4763,31 @@ async function fetchLyricsPlusAppleCluster(identity, tokens, durationSec, source
   });
 
   const tryMirror = async (baseUrl) => {
-    const [v2Res, ttmlRes] = await Promise.allSettled([
-      fetchWithTimeout(`${baseUrl}/v2/lyrics/get?${v2QsNoAlb.toString()}`, {
+    const [v2Res, v2NoAlbRes, ttmlRes] = await Promise.allSettled([
+      fetchWithTimeout(`${baseUrl}/v2/lyrics/get?${v2QsWithAlb.toString()}`, {
         headers: { "User-Agent": SAAVN_HEADERS["User-Agent"], "Accept": "application/json" }
-      }, 3600),
+      }, 4200),
+      queryAlbum
+        ? fetchWithTimeout(`${baseUrl}/v2/lyrics/get?${v2QsNoAlb.toString()}`, {
+            headers: { "User-Agent": SAAVN_HEADERS["User-Agent"], "Accept": "application/json" }
+          }, 4200)
+        : Promise.reject(new Error("Skip")),
       fetchWithTimeout(`${baseUrl}/v1/ttml/get?${ttmlQs.toString()}`, {
         headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
-      }, 3600)
+      }, 4200)
     ]);
 
-    if (v2Res.status === "fulfilled" && v2Res.value.ok) {
-      const data = await v2Res.value.json();
-      const parsed = parseLyricsPlusJsonToTimeline(data, queryDur, queryTitle, queryArtist);
-      if (parsed && parsed.lines.length >= 2) {
-        return {
-          lines: parsed.lines,
-          hasTrueWordSync: parsed.hasTrueWordSync,
-          source: `AppleLyricsPlus (${parsed.upstreamSource})`
-        };
+    for (const candidateRes of [v2Res, v2NoAlbRes]) {
+      if (candidateRes.status === "fulfilled" && candidateRes.value.ok) {
+        const data = await candidateRes.value.json();
+        const parsed = parseLyricsPlusJsonToTimeline(data, queryDur, queryTitle, queryArtist);
+        if (parsed && parsed.lines.length >= 2) {
+          return {
+            lines: parsed.lines,
+            hasTrueWordSync: parsed.hasTrueWordSync,
+            source: `AppleLyricsPlus (${parsed.upstreamSource})`
+          };
+        }
       }
     }
 
@@ -6461,22 +4795,61 @@ async function fetchLyricsPlusAppleCluster(identity, tokens, durationSec, source
       const raw = await ttmlRes.value.text();
       if (raw.includes("<p")) {
         const lines = parseTtmlToTimeline(raw, queryDur, queryTitle, queryArtist);
-        if (validateFetchedLyricsTimeline(lines, queryDur)) {
+        if (lines.length >= 2) {
           return { lines, hasTrueWordSync: true, source: "AppleLyricsPlusTtml" };
         }
       }
+      try {
+        const j = JSON.parse(raw);
+        if (typeof j?.ttml === "string" && j.ttml.includes("<p")) {
+          const lines = parseTtmlToTimeline(j.ttml, queryDur, queryTitle, queryArtist);
+          if (lines.length >= 2) {
+            return { lines, hasTrueWordSync: true, source: "AppleLyricsPlusTtml" };
+          }
+        }
+      } catch {}
     }
 
     throw new Error("Miss");
   };
 
   try {
-    return await Promise.any(LYRICSPLUS_MIRRORS.slice(0, 4).map(m => tryMirror(m)));
+    return await Promise.any(LYRICSPLUS_MIRRORS.slice(0, 5).map(m => tryMirror(m)));
   } catch {
+    if (tokens.primaryTitle && tokens.primaryTitle.toLowerCase() !== queryTitle.toLowerCase()) {
+      const altQs = new URLSearchParams({
+        title: tokens.primaryTitle,
+        artist: tokens.artists[0] || queryArtist,
+        duration: String(queryDur),
+        source: sources
+      });
+      try {
+        return await Promise.any(
+          LYRICSPLUS_MIRRORS.slice(0, 3).map(async (baseUrl) => {
+            const r = await fetchWithTimeout(`${baseUrl}/v2/lyrics/get?${altQs.toString()}`, {
+              headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
+            }, 3400);
+            if (!r.ok) throw new Error("Miss");
+            const d = await r.json();
+            const p = parseLyricsPlusJsonToTimeline(d, queryDur, tokens.primaryTitle, tokens.artists[0] || "");
+            if (!p || p.lines.length < 2) throw new Error("Empty");
+            return {
+              lines: p.lines,
+              hasTrueWordSync: p.hasTrueWordSync,
+              source: `AppleLyricsPlus (${p.upstreamSource})`
+            };
+          })
+        );
+      } catch {}
+    }
     return null;
   }
 }
 
+/**
+ * TIER 1C: LRC.RED Direct Apple TTML (`/s/{isrc}.ttml`), Unison (`unison.boidu.dev` / `unison.betterlyrics.org`),
+ * BetterLyrics (`lyrics-api.boidu.dev`), & BiniLyrics (`lyrics-api.binimum.org`)
+ */
 async function fetchExternalAppleTtmlProviders(identity, tokens, durationSec) {
   const title = identity?.canonicalTitle || tokens.primaryTitle;
   const artist = identity?.primaryAppleArtist || tokens.artists[0] || "";
@@ -6488,65 +4861,98 @@ async function fetchExternalAppleTtmlProviders(identity, tokens, durationSec) {
 
   const tasks = [];
 
+  // 1. LRC.RED Direct Apple Music TTML by ISRC (`https://lrc.red/s/{isrc}.ttml`)
   for (const isrc of isrcList.slice(0, 2)) {
     tasks.push((async () => {
       const res = await fetchWithTimeout(`https://lrc.red/s/${encodeURIComponent(isrc)}.ttml`, {
         headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
-      }, 3200);
+      }, 3600);
       if (!res.ok) throw new Error("No LRC.RED TTML");
       const xml = await res.text();
       if (xml.includes("<p")) {
         const lines = parseTtmlToTimeline(xml, dur, title, artist);
-        if (validateFetchedLyricsTimeline(lines, dur)) return { lines, source: "AppleMusicLrcRedTtml", syncType: "WORD" };
+        if (lines.length >= 2) return { lines, source: "AppleMusicLrcRedTtml", syncType: "WORD" };
       }
       throw new Error("Invalid TTML");
     })());
   }
 
-  if (title && artist) {
+  // 2. Unison Apple Music TTML API (`unison.boidu.dev` & `unison.betterlyrics.org`)
+  for (const unisonHost of ["https://unison.boidu.dev", "https://unison.betterlyrics.org"]) {
     tasks.push((async () => {
       const qs = new URLSearchParams({ song: title, artist });
       if (album) qs.set("album", album);
       if (dur > 0) qs.set("duration", String(dur));
       if (isrcList[0]) qs.set("isrc", isrcList[0]);
 
-      const res = await fetchWithTimeout(`https://unison.boidu.dev/lyrics?${qs.toString()}`, {
+      const res = await fetchWithTimeout(`${unisonHost}/lyrics?${qs.toString()}`, {
         headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
-      }, 3400);
+      }, 3800);
       if (!res.ok) throw new Error("Unison miss");
       const text = await res.text();
       if (text.includes("<p")) {
         const lines = parseTtmlToTimeline(text, dur, title, artist);
-        if (validateFetchedLyricsTimeline(lines, dur)) return { lines, source: "AppleMusicUnisonTtml", syncType: "WORD" };
+        if (lines.length >= 2) return { lines, source: "AppleMusicUnisonTtml", syncType: "WORD" };
       }
       const data = JSON.parse(text);
       const ttml = data?.ttml || data?.lyrics || data?.data?.ttml;
       if (typeof ttml === "string" && ttml.includes("<p")) {
         const lines = parseTtmlToTimeline(ttml, dur, title, artist);
-        if (validateFetchedLyricsTimeline(lines, dur)) return { lines, source: "AppleMusicUnisonTtml", syncType: "WORD" };
+        if (lines.length >= 2) return { lines, source: "AppleMusicUnisonTtml", syncType: "WORD" };
+      }
+      if (typeof ttml === "string" && /\[\d{1,3}:\d{2}/.test(ttml)) {
+        const parsed = parseLrcToTimeline(ttml, dur, title, artist);
+        if (parsed.lines.length >= 2) return { lines: parsed.lines, source: "UnisonSyncedLrc", syncType: parsed.hasEnhancedWordTags ? "WORD" : "LINE_ENHANCED" };
       }
       throw new Error("No Unison TTML");
     })());
-
-    tasks.push((async () => {
-      const qs = new URLSearchParams({ s: title, a: artist, title, artist });
-      if (dur > 0) {
-        qs.set("d", String(dur));
-        qs.set("duration", String(dur));
-      }
-      const res = await fetchWithTimeout(`https://lyrics-api.boidu.dev/getLyrics?${qs.toString()}`, {
-        headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
-      }, 3200);
-      if (!res.ok) throw new Error("Miss");
-      const data = await res.json();
-      const ttml = data?.ttml || data?.lyrics;
-      if (typeof ttml === "string" && ttml.includes("<p")) {
-        const lines = parseTtmlToTimeline(ttml, dur, title, artist);
-        if (validateFetchedLyricsTimeline(lines, dur)) return { lines, source: "AppleMusicBetterLyricsTtml", syncType: "WORD" };
-      }
-      throw new Error("No TTML");
-    })());
   }
+
+  // 3. BetterLyrics TTML (`lyrics-api.boidu.dev/getLyrics`)
+  tasks.push((async () => {
+    const qs = new URLSearchParams({ s: title, a: artist, title, artist });
+    if (album) {
+      qs.set("al", album);
+      qs.set("album", album);
+    }
+    if (dur > 0) {
+      qs.set("d", String(dur));
+      qs.set("duration", String(dur));
+    }
+    const res = await fetchWithTimeout(`https://lyrics-api.boidu.dev/getLyrics?${qs.toString()}`, {
+      headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
+    }, 3600);
+    if (!res.ok) throw new Error("Miss");
+    const data = await res.json();
+    const ttml = data?.ttml || data?.lyrics;
+    if (typeof ttml === "string" && ttml.includes("<p")) {
+      const lines = parseTtmlToTimeline(ttml, dur, title, artist);
+      if (lines.length >= 2) return { lines, source: "AppleMusicBetterLyricsTtml", syncType: "WORD" };
+    }
+    throw new Error("No TTML");
+  })());
+
+  // 4. BiniLyrics TTML (`lyrics-api.binimum.org`)
+  tasks.push((async () => {
+    const qs = new URLSearchParams({ track: title, artist });
+    if (album) qs.set("album", album);
+    const res = await fetchWithTimeout(`https://lyrics-api.binimum.org/?${qs.toString()}`, {
+      headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] }
+    }, 3600);
+    if (!res.ok) throw new Error("Miss");
+    const text = await res.text();
+    if (text.includes("<p")) {
+      const lines = parseTtmlToTimeline(text, dur, title, artist);
+      if (lines.length >= 2) return { lines, source: "AppleMusicBiniTtml", syncType: "WORD" };
+    }
+    const json = JSON.parse(text);
+    const ttmlContent = json?.ttml || json?.lyrics || json?.results?.[0]?.ttml;
+    if (typeof ttmlContent === "string" && ttmlContent.includes("<p")) {
+      const lines = parseTtmlToTimeline(ttmlContent, dur, title, artist);
+      if (lines.length >= 2) return { lines, source: "AppleMusicBiniTtml", syncType: "WORD" };
+    }
+    throw new Error("No Bini TTML");
+  })());
 
   try {
     return await Promise.any(tasks);
@@ -6555,6 +4961,10 @@ async function fetchExternalAppleTtmlProviders(identity, tokens, durationSec) {
   }
 }
 
+/**
+ * TIER 2A: LRCLIB + LRCMUX + LRC.RED Multi-Vector Search (`searchLrclibCandidates`)
+ * Fixed to NEVER fail on album name mismatches and to score regional/film tracks accurately!
+ */
 async function searchLrclibCandidates(tokens, durationSec, identity = null) {
   const headers = { "User-Agent": `${WORKER_NAME}/${WORKER_VERSION} (https://projectvelo.tjcodewizard.workers.dev)` };
   const urls = [];
@@ -6565,9 +4975,13 @@ async function searchLrclibCandidates(tokens, durationSec, identity = null) {
   const isrcList = identity?.isrcList || (identity?.isrc ? [identity.isrc] : []);
 
   if (titleA && artistA) {
+    // Query `/api/get` WITHOUT `album_name` so album naming differences on JioSaavn vs LRCLIB never cause 404s!
     const getQsNoAlb = new URLSearchParams({ track_name: titleA, artist_name: artistA });
     if (durationSec > 0) getQsNoAlb.set("duration", String(durationSec));
     urls.push(`https://lrclib.net/api/get?${getQsNoAlb.toString()}`);
+    urls.push(`https://api.lrcmux.dev/compat/lrclib/api/get?${getQsNoAlb.toString()}`);
+
+    urls.push(`https://lrclib.net/api/search?track_name=${encodeURIComponent(titleA)}&artist_name=${encodeURIComponent(artistA)}`);
     urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(`${titleA} ${artistA}`)}`);
   }
 
@@ -6577,22 +4991,23 @@ async function searchLrclibCandidates(tokens, durationSec, identity = null) {
   if (tokens.primaryTitle && tokens.album) {
     urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(`${tokens.primaryTitle} ${tokens.album}`)}`);
   }
-  if (titleA && !artistA) {
+  if (titleA) {
     urls.push(`https://lrclib.net/api/search?q=${encodeURIComponent(titleA)}`);
   }
 
-  const uniqueUrls = [...new Set(urls)].slice(0, 4);
+  const uniqueUrls = [...new Set(urls)].slice(0, 6);
 
   const [settled, lrcRedLrcSettled] = await Promise.all([
     Promise.allSettled(
       uniqueUrls.map(u =>
-        fetchWithTimeout(u, { headers }, 3600).then(r => (r.ok ? r.json() : null))
+        fetchWithTimeout(u, { headers }, 4200).then(r => (r.ok ? r.json() : null))
       )
     ),
+    // Also check LRC.RED direct `.lrc` file by ISRC!
     isrcList.length > 0
       ? Promise.allSettled(
-          isrcList.slice(0, 1).map(isrc =>
-            fetchWithTimeout(`https://lrc.red/s/${encodeURIComponent(isrc)}.lrc`, { headers }, 3000)
+          isrcList.slice(0, 2).map(isrc =>
+            fetchWithTimeout(`https://lrc.red/s/${encodeURIComponent(isrc)}.lrc`, { headers }, 3400)
               .then(r => (r.ok ? r.text() : null))
           )
         )
@@ -6642,7 +5057,7 @@ async function searchLrclibCandidates(tokens, durationSec, identity = null) {
 
   const scored = allCandidates
     .map(item => ({ item, score: scoreLrcCandidate(item, enrichedTokens, durationSec, true) }))
-    .filter(x => x.score >= 120)
+    .filter(x => x.score >= 42)
     .sort((a, b) => b.score - a.score);
 
   const bestSynced = scored.find(x => x.item.syncedLyrics)?.item || null;
@@ -6651,6 +5066,9 @@ async function searchLrclibCandidates(tokens, durationSec, identity = null) {
   return { bestSynced, bestPlain };
 }
 
+/**
+ * TIER 2B: Spotify & Musixmatch Synced Lyrics + KuGou LRC Fallback
+ */
 async function fetchSpotifyAndMusixmatchFallback(identity, tokens, durationSec) {
   const lpSpotify = await fetchLyricsPlusAppleCluster(
     identity,
@@ -6665,6 +5083,39 @@ async function fetchSpotifyAndMusixmatchFallback(identity, tokens, durationSec) 
       source: lpSpotify.source
     };
   }
+
+  try {
+    let spId = identity?.spotifyTrackId || "";
+    const title = identity?.canonicalTitle || tokens.primaryTitle;
+    const artist = identity?.primaryAppleArtist || tokens.artists[0] || "";
+    if (!spId && title) {
+      const sRes = await fetchWithTimeout(
+        `https://lyrics.paxsenix.org/spotify/search?q=${encodeURIComponent(`${title} ${artist}`.trim())}`,
+        { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
+        2800
+      );
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        const firstHit = Array.isArray(sData) ? sData[0] : (sData?.results?.[0] || sData?.tracks?.[0]);
+        if (firstHit?.id) spId = String(firstHit.id);
+      }
+    }
+    if (spId) {
+      const lRes = await fetchWithTimeout(
+        `https://lyrics.paxsenix.org/spotify/lyrics?id=${encodeURIComponent(spId)}`,
+        { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
+        3200
+      );
+      if (lRes.ok) {
+        const lData = await lRes.json();
+        const lines = parsePaxsenixAppleJsonToTimeline(lData, durationSec, title, artist);
+        if (lines.length >= 2) {
+          return { lines, syncType: "LINE_ENHANCED", source: "SpotifyDirectSyncedProvider" };
+        }
+      }
+    }
+  } catch {}
+
   return null;
 }
 
@@ -6674,14 +5125,15 @@ async function searchNeteaseAndKugouLyrics(tokens, durationSec, identity = null)
   const query = [title, artist || tokens.album || ""].filter(Boolean).join(" ").trim();
   if (!query) return null;
 
+  // 1. Try NetEase YRC / LRC
   try {
-    const searchUrl = `https://music.163.com/api/cloudsearch/pc?s=${encodeURIComponent(query)}&type=1&offset=0&limit=5`;
+    const searchUrl = `https://music.163.com/api/cloudsearch/pc?s=${encodeURIComponent(query)}&type=1&offset=0&limit=6`;
     const searchRes = await fetchWithTimeout(searchUrl, {
       headers: {
         "User-Agent": SAAVN_HEADERS["User-Agent"],
         "Referer": "https://music.163.com/"
       }
-    }, 2800);
+    }, 3200);
 
     if (searchRes.ok) {
       const searchData = await searchRes.json();
@@ -6704,29 +5156,64 @@ async function searchNeteaseAndKugouLyrics(tokens, durationSec, identity = null)
         }
       }
 
-      if (bestSong && bestScore >= 135) {
+      if (bestSong && bestScore >= 58) {
         const lrcRes = await fetchWithTimeout(`https://music.163.com/api/song/lyric?id=${bestSong.id}&lv=1&kv=1&tv=-1&yv=1`, {
           headers: {
             "User-Agent": SAAVN_HEADERS["User-Agent"],
             "Referer": "https://music.163.com/"
           }
-        }, 2800);
+        }, 3200);
 
         if (lrcRes.ok) {
           const lrcJson = await lrcRes.json();
           const rawYrc = lrcJson?.yrc?.lyric || "";
           if (rawYrc && rawYrc.length > 30) {
             const yrcLines = parseNeteaseYrcToTimeline(rawYrc, durationSec, title, artist);
-            if (validateFetchedLyricsTimeline(yrcLines, durationSec)) {
+            if (yrcLines.length >= 3) {
               return { source: "NetEaseVerbatimYrcProvider", syncType: "WORD", lines: yrcLines };
             }
           }
           const rawLrc = lrcJson?.lrc?.lyric || "";
           if (rawLrc && rawLrc.length >= 25) {
             const parsed = parseLrcToTimeline(rawLrc, durationSec, title, artist);
-            if (validateFetchedLyricsTimeline(parsed.lines, durationSec)) {
+            if (parsed.lines.length >= 3) {
               return {
                 source: "NetEaseLrcProvider",
+                syncType: parsed.hasEnhancedWordTags ? "WORD" : "LINE_ENHANCED",
+                lines: parsed.lines
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // 2. Try KuGou LRC Search (`lyrics.kugou.com`)
+  try {
+    const durMs = (durationSec || 200) * 1000;
+    const kgSearchRes = await fetchWithTimeout(
+      `http://lyrics.kugou.com/search?ver=1&man=yes&client=pc&keyword=${encodeURIComponent(query)}&duration=${durMs}&hash=`,
+      { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
+      2800
+    );
+    if (kgSearchRes.ok) {
+      const kgData = await kgSearchRes.json();
+      const cand = kgData?.candidates?.[0];
+      if (cand?.id && cand?.accesskey) {
+        const dlRes = await fetchWithTimeout(
+          `http://lyrics.kugou.com/download?ver=1&client=pc&id=${cand.id}&accesskey=${cand.accesskey}&fmt=lrc&charset=utf8`,
+          { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
+          2800
+        );
+        if (dlRes.ok) {
+          const dlJson = await dlRes.json();
+          if (dlJson?.content) {
+            const rawLrc = decodeURIComponent(escape(atob(dlJson.content)));
+            const parsed = parseLrcToTimeline(rawLrc, durationSec, title, artist);
+            if (parsed.lines.length >= 3) {
+              return {
+                source: "KugouLrcProvider",
                 syncType: parsed.hasEnhancedWordTags ? "WORD" : "LINE_ENHANCED",
                 lines: parsed.lines
               };
@@ -6740,6 +5227,11 @@ async function searchNeteaseAndKugouLyrics(tokens, durationSec, identity = null)
   return null;
 }
 
+/**
+ * Formats the final `/lyrics` payload with 100% LRCLIB Standard Compatibility
+ * (`id`, `name`, `trackName`, `artistName`, `albumName`, `duration`, `instrumental`, `plainLyrics`, `syncedLyrics`, `enhancedLyrics`, `lrclib`)
+ * PLUS ProjectVelo's Bilingual Word-by-Word Timeline (`lines`, `romanizedLines`, `nativeLines`, `bilingualLines`).
+ */
 function buildUnifiedLyricsResponse({
   source,
   syncType = "WORD",
@@ -6852,7 +5344,7 @@ async function resolveRealtimeLyrics(url, request = null) {
       if (Array.isArray(memoSong.allArtists)) extraArtists = memoSong.allArtists;
     } else if (/^\d+$/.test(songId)) {
       try {
-        const details = await fetchSaavnJson({ __call: "song.getDetails", pids: songId }, 2600);
+        const details = await fetchSaavnJson({ __call: "song.getDetails", pids: songId });
         const songObj = details?.[songId] || details?.songs?.[0] || Object.values(details || {})[0];
         if (songObj) {
           const enriched = enrichSaavnSong(songObj, url.origin);
@@ -6866,6 +5358,7 @@ async function resolveRealtimeLyrics(url, request = null) {
     }
   }
 
+  // Record song play in client taste profile so Spotify recommendations learn from every song played!
   if (request && (trackName || songId)) {
     recordClientTrackInteraction(request, url, {
       id: songId,
@@ -6879,6 +5372,7 @@ async function resolveRealtimeLyrics(url, request = null) {
 
   const tokens = extractLyricsSearchTokens(trackName || rawQ, artistName, albumName, extraArtists);
 
+  // STAGE 1: 7-Vector Track Identification (Apple Music Track IDs + ISRC + Canonical Metadata)
   const identity = await resolveWorldClassTrackIdentity(tokens, durationSec, explicitAppleId, explicitSpotifyId);
   if (identity) {
     if (!durationSec && identity.canonicalDuration) {
@@ -6889,6 +5383,7 @@ async function resolveRealtimeLyrics(url, request = null) {
     }
   }
 
+  // STAGE 2 (TIER 1 — APPLE MUSIC HEAVY): Query All Apple Music Providers + LRCLIB Concurrently
   const [
     paxAppleHit,
     lpAppleHit,
@@ -6905,7 +5400,7 @@ async function resolveRealtimeLyrics(url, request = null) {
     lpAppleHit ? { ...lpAppleHit, syncType: lpAppleHit.hasTrueWordSync ? "WORD" : "LINE_ENHANCED" } : null,
     paxAppleHit,
     extTtmlHit ? { ...extTtmlHit, syncType: extTtmlHit.syncType || "WORD" } : null
-  ].filter(h => h && Array.isArray(h.lines) && validateFetchedLyricsTimeline(h.lines, durationSec));
+  ].filter(h => h && Array.isArray(h.lines) && h.lines.length >= 2);
 
   if (appleHits.length > 0) {
     appleHits.sort((a, b) => {
@@ -6933,6 +5428,7 @@ async function resolveRealtimeLyrics(url, request = null) {
     });
   }
 
+  // STAGE 3 (TIER 2 — LRCLIB SYNCED & ENHANCED LRC):
   if (lrcResult?.bestSynced?.syncedLyrics) {
     const winner = lrcResult.bestSynced;
     const effectiveDur = durationSec || Math.round(winner.duration || 185);
@@ -6942,7 +5438,7 @@ async function resolveRealtimeLyrics(url, request = null) {
       winner.trackName || tokens.primaryTitle,
       winner.artistName || artistName
     );
-    if (validateFetchedLyricsTimeline(parsed.lines, effectiveDur)) {
+    if (parsed.lines.length >= 2) {
       return buildUnifiedLyricsResponse({
         source: parsed.hasEnhancedWordTags ? "LrcLibEnhancedWordProvider" : "LrcLibRealtimeWordSyncProvider",
         syncType: parsed.hasEnhancedWordTags ? "WORD" : "LINE_ENHANCED",
@@ -6960,12 +5456,13 @@ async function resolveRealtimeLyrics(url, request = null) {
     }
   }
 
+  // STAGE 4 (TIER 2B — SPOTIFY, MUSIXMATCH, NETEASE YRC/LRC, KUGOU LRC):
   const [spotifyMxmHit, neteaseKugouHit] = await Promise.all([
     fetchSpotifyAndMusixmatchFallback(identity, tokens, durationSec),
     searchNeteaseAndKugouLyrics(tokens, durationSec, identity)
   ]);
 
-  if (spotifyMxmHit && validateFetchedLyricsTimeline(spotifyMxmHit.lines, durationSec)) {
+  if (spotifyMxmHit && spotifyMxmHit.lines.length >= 2) {
     return buildUnifiedLyricsResponse({
       source: spotifyMxmHit.source,
       syncType: spotifyMxmHit.syncType || "LINE_ENHANCED",
@@ -6982,7 +5479,7 @@ async function resolveRealtimeLyrics(url, request = null) {
     });
   }
 
-  if (neteaseKugouHit && validateFetchedLyricsTimeline(neteaseKugouHit.lines, durationSec)) {
+  if (neteaseKugouHit && neteaseKugouHit.lines.length >= 2) {
     return buildUnifiedLyricsResponse({
       source: neteaseKugouHit.source,
       syncType: neteaseKugouHit.syncType || "WORD",
@@ -6999,6 +5496,7 @@ async function resolveRealtimeLyrics(url, request = null) {
     });
   }
 
+  // STAGE 5 (TIER 3 — LRCLIB PLAIN LYRICS -> TEMPO-ADAPTIVE WORD SYNC):
   if (lrcResult?.bestPlain?.plainLyrics) {
     const winner = lrcResult.bestPlain;
     const effectiveDur = durationSec || Math.round(winner.duration || 185);
@@ -7048,7 +5546,7 @@ async function resolveRealtimeLyrics(url, request = null) {
 }
 
 // ============================================================================
-// DEDICATED OFFLINE SONG DOWNLOAD ENGINE (`/download`)
+// DEDICATED OFFLINE SONG DOWNLOAD ENGINE (`/download` & `/download/batch`)
 // ============================================================================
 
 function sanitizeDownloadFilename(str) {
@@ -7079,10 +5577,12 @@ async function handleOfflineSongDownload(request, url, ctx) {
   }
 
   if (metaOnly && songId) {
+    const fakeSongUrl = new URL(`${url.origin}/song?id=${encodeURIComponent(songId)}&quality=${quality}`);
     const songRes = await handleOneHopPlay(request, url, ctx, true);
     return jsonResponse(songRes || { error: "Could not resolve download metadata" });
   }
 
+  // Delegate stream resolution to `handleOneHopPlay` with download headers attached
   const playRes = await handleOneHopPlay(request, url, ctx, false);
   if (!playRes || (!playRes.ok && playRes.status !== 206)) {
     return playRes;
@@ -7101,7 +5601,7 @@ async function handleOfflineSongDownload(request, url, ctx) {
 
   const resolvedBr = dlHeaders.get("X-Resolved-Bitrate") || `${quality}kbps`;
   const contentType = dlHeaders.get("Content-Type") || "audio/mp4";
-  const ext = contentType.includes("mpeg") ? "mp3" : (contentType.includes("webm") ? "webm" : "m4a");
+  const ext = contentType.includes("mpeg") ? "mp3" : "m4a";
   const safeFileName = `${sanitizeDownloadFilename(artist ? `${artist} - ${title}` : title)} (${resolvedBr}).${ext}`;
 
   dlHeaders.set(
@@ -7121,7 +5621,7 @@ async function handleOfflineSongDownload(request, url, ctx) {
 }
 
 // ============================================================================
-// MAIN WORKER ROUTER (ProjectVelo v13.0.0)
+// MAIN WORKER ROUTER (ProjectVelo v10.0.0)
 // ============================================================================
 
 export default {
@@ -7142,10 +5642,6 @@ export default {
 
       if (path === "/play") {
         return await handleOneHopPlay(request, url, ctx, false);
-      }
-
-      if (path === "/video" || path === "/mv" || path === "/videosong") {
-        return await handleVideoEndpoint(request, url, ctx);
       }
 
       if (path === "/download") {
@@ -7219,7 +5715,7 @@ export default {
             "X-Lyrics-Sync-Type": lyricsData.syncType || "WORD",
             "X-Worker-Engine": `${WORKER_NAME}/${WORKER_VERSION}`
           });
-        }, "v13-projectvelo-lyrics");
+        }, "v10-projectvelo-lyrics");
       }
 
       if (path === "/album") {
@@ -7228,7 +5724,7 @@ export default {
         return await withEdgeCache(request, ctx, 1800, async () => {
           const data = await resolveCompleteAlbum(albumId, url.origin, quality);
           return jsonResponse(data);
-        }, "v13-projectvelo-album");
+        }, "v10-projectvelo-album");
       }
 
       if (path === "/song") {
@@ -7237,20 +5733,19 @@ export default {
         const quality = resolveRequestedAudioQuality(request, url);
         return await withEdgeCache(request, ctx, 1800, async () => {
           const pidStr = String(pids);
-          if (pidStr.startsWith("apple:") || pidStr.startsWith("spotify:") || pidStr.startsWith("ytm:") || pidStr.startsWith("curated:")) {
+          if (pidStr.startsWith("apple:") || pidStr.startsWith("spotify:") || pidStr.startsWith("curated:")) {
             const memo = SONG_META_MEMO.get(pidStr);
             let title = memo?.title || url.searchParams.get("title") || "";
             let artist = memo?.artist || url.searchParams.get("artist") || "";
             let album = memo?.album || url.searchParams.get("album") || "";
             let appleId = pidStr.startsWith("apple:") ? pidStr.slice(6) : (memo?.appleId || "");
             let spotifyId = pidStr.startsWith("spotify:") ? pidStr.split(":").pop() : (memo?.spotifyId || "");
-            let ytVideoId = pidStr.startsWith("ytm:") ? pidStr.slice(4) : (memo?.ytVideoId || "");
 
             if ((!title || !artist) && appleId && /^\d+$/.test(appleId)) {
               const lookupRes = await fetchWithTimeout(
                 `https://itunes.apple.com/lookup?id=${encodeURIComponent(appleId)}&country=in`,
                 { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-                2400
+                2800
               );
               if (lookupRes.ok) {
                 const lj = await lookupRes.json();
@@ -7262,7 +5757,7 @@ export default {
                 }
               }
             } else if ((!title || !artist) && spotifyId) {
-              const spEnt = await fetchSpotifyEmbedEntity("track", spotifyId, 2600);
+              const spEnt = await fetchSpotifyEmbedEntity("track", spotifyId, 3000);
               if (spEnt) {
                 title = spEnt.title || title;
                 artist = spEnt.artist || artist;
@@ -7270,42 +5765,18 @@ export default {
             }
 
             const q = `${extractCoreTrackTitle(title)} ${String(artist || "").split(/[,&]/)[0]}`.trim();
-            const sData = q ? await fetchSaavnJson({ __call: "search.getResults", api_version: "4", n: "8", p: "1", q }, 2600).catch(() => null) : null;
+            const sData = await fetchSaavnJson({ __call: "search.getResults", api_version: "4", n: "8", p: "1", q });
             const pool = await batchHealMissingMediaUrls(sData?.results || []);
             const curatedItem = {
               appleId,
               spotifyId,
-              ytVideoId,
               trackName: title || "Track",
               artistName: artist,
               collectionName: album,
               artworkUrl100: memo?.image || ""
             };
-            const matched = findBestSaavnMatchForCuratedTrack(curatedItem, pool);
+            const matched = findBestSaavnMatchForCuratedTrack(curatedItem, pool) || pool[0] || null;
             const bridged = buildCuratedBridgedSongObject(curatedItem, matched, url.origin, quality);
-
-            if (!matched) {
-              const secAudio = await resolveSecondaryHighResAudioStream({
-                title: bridged.title,
-                artist: bridged.artist,
-                album: bridged.album,
-                durationSec: bridged.duration,
-                ytVideoId,
-                preferredQuality: quality
-              });
-              if (secAudio?.streamUrl) {
-                const proxiedSecUrl = `${url.origin}/stream?url=${encodeURIComponent(secAudio.streamUrl)}&quality=${quality}`;
-                bridged.decrypted_media_url = proxiedSecUrl;
-                bridged.streamUrl = proxiedSecUrl;
-                bridged.playUrl = proxiedSecUrl;
-                bridged.audioSource = secAudio.provider;
-                if (!bridged.image && secAudio.thumbnailUrl) {
-                  bridged.image = secAudio.thumbnailUrl;
-                  bridged.coverUrl = proxyImg(secAudio.thumbnailUrl, url.origin);
-                }
-              }
-            }
-
             return jsonResponse({ songs: [bridged], track: bridged });
           }
 
@@ -7315,12 +5786,13 @@ export default {
             : Object.values(data || {}).filter(v => v && typeof v === "object" && v.id);
           const songs = rawList.map(s => enrichSaavnSong(s, url.origin, null, quality));
           return jsonResponse({ songs, track: songs[0] || null });
-        }, "v13-projectvelo-song");
+        }, "v10-projectvelo-song");
       }
 
       if (path === "/reco" || path === "/queue/recommendations") {
         const pid = url.searchParams.get("id") || url.searchParams.get("pid") || url.searchParams.get("title");
         if (!pid) return jsonResponse({ error: "Missing ?id=<songId> or ?title=<songTitle>" }, 400);
+        // Short 180s cache or dynamic per-exclude list so queue recommendations stay fresh as you play
         const recoData = await fetchSpotifyAdaptiveRecommendations(request, url, ctx);
         return jsonResponse(recoData, 200, {
           "X-Reco-Source": "SpotifyAdaptiveRecommendationEngine"
@@ -7334,7 +5806,7 @@ export default {
           return jsonResponse(homeData, 200, {
             "X-Home-Source": "SpotifyAndAppleMusicCharts"
           });
-        }, "v13-projectvelo-home");
+        }, "v10-projectvelo-home");
       }
 
       if (path === "/search") {
@@ -7342,16 +5814,15 @@ export default {
       }
 
       return jsonResponse({
-        service: `${WORKER_NAME} v${WORKER_VERSION} — Primary JioSaavn 320kbps + Direct YouTube & YouTube Music Edge Audio/Video Streamer + Audio-Video Sync Engine + High-Precision Word-Sync Lyrics`,
+        service: `${WORKER_NAME} v${WORKER_VERSION} — Spotify & Apple Music Curated Intelligence + JioSaavn 320kbps Multi-Quality Audio + Apple Music & LRCLIB Word-Sync Engine`,
         repository: "ProjectVelo",
         status: "online",
         defaultAudioQuality: "320kbps (Highest Resolution)",
         endpoints: {
           stream: `${url.origin}/stream?url=<target>&quality=320|160|96|auto`,
-          play: `${url.origin}/play?id=<songId>&appleId=<appleTrackId>&spotifyId=<spotifyTrackId>&ytVideoId=<videoId>&title=<title>&artist=<artist>&quality=320|160|96`,
-          video: `${url.origin}/video?id=<songId>&title=<title>&artist=<artist>&mode=stream|json`,
+          play: `${url.origin}/play?id=<songId>&appleId=<appleTrackId>&spotifyId=<spotifyTrackId>&title=<title>&artist=<artist>&quality=320|160|96`,
           download: `${url.origin}/download?id=<songId>&title=<title>&artist=<artist>&quality=320|160|96`,
-          import: `${url.origin}/import?url=<Spotify_AppleMusic_or_YouTubeMusic_Playlist_URL>`,
+          import: `${url.origin}/import?url=<Spotify_or_Apple_Music_Playlist_URL>`,
           lyrics: `${url.origin}/lyrics?id=<songId>&appleId=<appleTrackId>&trackName=<title>&artistName=<artist>&albumName=<album>&duration=<sec>`,
           lrclib: `${url.origin}/lrclib?trackName=<title>&artistName=<artist>&duration=<sec>`,
           reco: `${url.origin}/reco?id=<songId>&limit=10`,
@@ -7379,12 +5850,10 @@ async function handleOneHopPlay(request, url, ctx, returnMetaOnly = false) {
   const songId = (url.searchParams.get("id") || url.searchParams.get("pid") || "").trim();
   const appleId = (url.searchParams.get("appleId") || (songId.startsWith("apple:") ? songId.slice(6) : "")).trim();
   const spotifyId = (url.searchParams.get("spotifyId") || (songId.startsWith("spotify:") ? songId.split(":").pop() : "")).trim();
-  let ytVideoId = (url.searchParams.get("ytVideoId") || (songId.startsWith("ytm:") ? songId.slice(4) : "")).trim();
   let rawMediaUrl = (url.searchParams.get("url") || "").trim();
   let title = (url.searchParams.get("title") || url.searchParams.get("trackName") || "").trim();
   let artist = (url.searchParams.get("artist") || url.searchParams.get("artistName") || "").trim();
   let album = (url.searchParams.get("album") || "").trim();
-  let durationSec = parseInt(url.searchParams.get("duration") || "0", 10) || 0;
 
   if (rawMediaUrl && (rawMediaUrl.includes("/play?") || rawMediaUrl.includes("/download?"))) {
     rawMediaUrl = "";
@@ -7392,19 +5861,17 @@ async function handleOneHopPlay(request, url, ctx, returnMetaOnly = false) {
 
   if (songId && SONG_META_MEMO.has(songId)) {
     const memo = SONG_META_MEMO.get(songId);
-    if (memo.decrypted_media_url && !memo.decrypted_media_url.includes("/play?")) {
+    if (memo.decrypted_media_url && memo.decrypted_media_url.includes("saavncdn.com")) {
       rawMediaUrl = memo.decrypted_media_url;
     }
     if (!title) title = memo.title || "";
     if (!artist) artist = memo.artist || "";
     if (!album) album = memo.album || "";
-    if (!durationSec && memo.duration) durationSec = memo.duration;
-    if (!ytVideoId && memo.ytVideoId) ytVideoId = memo.ytVideoId;
   }
 
-  if (songId && !songId.startsWith("apple:") && !songId.startsWith("spotify:") && !songId.startsWith("ytm:") && !songId.startsWith("curated:") && !rawMediaUrl) {
+  if (songId && !songId.startsWith("apple:") && !songId.startsWith("spotify:") && !songId.startsWith("curated:") && !rawMediaUrl) {
     try {
-      const data = await fetchSaavnJson({ __call: "song.getDetails", pids: songId }, 2600);
+      const data = await fetchSaavnJson({ __call: "song.getDetails", pids: songId });
       const rawSong = data?.[songId] || data?.songs?.[0] || Object.values(data || {})[0];
       if (rawSong) {
         const enriched = enrichSaavnSong(rawSong, url.origin, null, quality);
@@ -7413,7 +5880,6 @@ async function handleOneHopPlay(request, url, ctx, returnMetaOnly = false) {
         }
         if (!title) title = enriched.title;
         if (!artist) artist = enriched.artist;
-        if (!durationSec) durationSec = enriched.duration;
         if (returnMetaOnly) return enriched;
       }
     } catch {}
@@ -7424,7 +5890,7 @@ async function handleOneHopPlay(request, url, ctx, returnMetaOnly = false) {
       const lookupRes = await fetchWithTimeout(
         `https://itunes.apple.com/lookup?id=${encodeURIComponent(appleId)}&country=in`,
         { headers: { "User-Agent": SAAVN_HEADERS["User-Agent"] } },
-        2400
+        2800
       );
       if (lookupRes.ok) {
         const lData = await lookupRes.json();
@@ -7433,21 +5899,20 @@ async function handleOneHopPlay(request, url, ctx, returnMetaOnly = false) {
           if (!title) title = cleanText(hit.trackName || "");
           if (!artist) artist = cleanText(hit.artistName || "");
           if (!album) album = cleanText(hit.collectionName || "");
-          if (!durationSec && hit.trackTimeMillis) durationSec = Math.round(hit.trackTimeMillis / 1000);
         }
       }
     } catch {}
   } else if ((!title || !artist) && spotifyId) {
-    const spEnt = await fetchSpotifyEmbedEntity("track", spotifyId, 2600);
+    const spEnt = await fetchSpotifyEmbedEntity("track", spotifyId, 2800);
     if (spEnt) {
       if (!title) title = spEnt.title || "";
       if (!artist) artist = spEnt.artist || "";
-      if (!durationSec && spEnt.tracks?.[0]?.durationSec) durationSec = spEnt.tracks[0].durationSec;
     }
   }
 
+  // Record interaction in user taste profile
   if (title || songId) {
-    recordClientTrackInteraction(request, url, { id: songId, appleId, spotifyId, ytVideoId, title, artist });
+    recordClientTrackInteraction(request, url, { id: songId, appleId, spotifyId, title, artist });
   }
 
   if (rawMediaUrl) {
@@ -7457,82 +5922,41 @@ async function handleOneHopPlay(request, url, ctx, returnMetaOnly = false) {
     }
   }
 
-  if (!songId.startsWith("ytm:") && title) {
-    const tokens = extractLyricsSearchTokens(title, artist, album);
-    const qStr = [tokens.primaryTitle, tokens.artists[0] || ""].filter(Boolean).join(" ").trim();
-    if (qStr) {
-      try {
-        const searchData = await fetchSaavnJson({
-          __call: "search.getResults",
-          api_version: "4",
-          n: "10",
-          p: "1",
-          q: qStr
-        }, 2800);
-        const rawPool = await batchHealMissingMediaUrls(searchData?.results || []);
-        const verifiedMatch = findBestSaavnMatchForCuratedTrack(
-          {
-            trackName: title,
-            artistName: artist,
-            collectionName: album,
-            durationSec
-          },
-          rawPool
-        );
+  const tokens = extractLyricsSearchTokens(title, artist, album);
+  const queriesToTry = [
+    [tokens.primaryTitle, tokens.artists[0] || ""].filter(Boolean).join(" ").trim(),
+    [tokens.primaryTitle, tokens.album || ""].filter(Boolean).join(" ").trim(),
+    tokens.primaryTitle
+  ].filter(Boolean);
 
-        if (verifiedMatch) {
-          const cand = enrichSaavnSong(verifiedMatch, url.origin, null, quality);
-          if (cand.decrypted_media_url && !cand.decrypted_media_url.includes("/play?")) {
-            if (returnMetaOnly) return cand;
-            const healedStream = await handleSmartStream(request, cand.decrypted_media_url, url.origin, ctx, true, quality);
-            if (healedStream && (healedStream.status === 200 || healedStream.status === 206)) {
-              if (appleId) setBoundedMemo(SONG_META_MEMO, `apple:${appleId}`, cand);
-              if (spotifyId) setBoundedMemo(SONG_META_MEMO, `spotify:${spotifyId}`, cand);
-              if (songId) setBoundedMemo(SONG_META_MEMO, songId, cand);
-              return healedStream;
-            }
-          }
+  for (const qStr of [...new Set(queriesToTry)].slice(0, 2)) {
+    try {
+      const searchData = await fetchSaavnJson({
+        __call: "search.getResults",
+        api_version: "4",
+        n: "12",
+        p: "1",
+        q: qStr
+      });
+      const candidates = await filterAndUpgradeSongs(searchData?.results || [], url.origin, qStr, quality);
+      for (const cand of candidates) {
+        if (cand.id === songId && rawMediaUrl) continue;
+        if (!cand.decrypted_media_url || cand.decrypted_media_url.includes("/play?")) continue;
+        if (returnMetaOnly) return cand;
+        const healedStream = await handleSmartStream(request, cand.decrypted_media_url, url.origin, ctx, true, quality);
+        if (healedStream && (healedStream.status === 200 || healedStream.status === 206)) {
+          if (appleId) setBoundedMemo(SONG_META_MEMO, `apple:${appleId}`, cand);
+          if (spotifyId) setBoundedMemo(SONG_META_MEMO, `spotify:${spotifyId}`, cand);
+          if (songId) setBoundedMemo(SONG_META_MEMO, songId, cand);
+          return healedStream;
         }
-      } catch {}
-    }
-  }
-
-  const secondaryAudio = await resolveSecondaryHighResAudioStream({
-    title,
-    artist,
-    album,
-    durationSec,
-    ytVideoId,
-    preferredQuality: quality
-  });
-
-  if (secondaryAudio && secondaryAudio.streamUrl) {
-    const proxiedSecUrl = `${url.origin}/stream?url=${encodeURIComponent(secondaryAudio.streamUrl)}`;
-    if (returnMetaOnly) {
-      return {
-        id: songId || `ytm:${secondaryAudio.videoId}`,
-        title: title || secondaryAudio.title,
-        artist: artist || secondaryAudio.uploader,
-        album: album || title,
-        duration: secondaryAudio.duration || durationSec,
-        audioSource: secondaryAudio.provider,
-        audioQuality: secondaryAudio.bitrate,
-        decrypted_media_url: proxiedSecUrl,
-        streamUrl: proxiedSecUrl
-      };
-    }
-
-    const candidates = [secondaryAudio.streamUrl, ...(secondaryAudio.fallbackUrls || [])];
-    return await pipeMediaStreamWithFallback(request, candidates, {
-      "X-Audio-Source": secondaryAudio.provider || "YouTubeMusicHighRes",
-      "X-Resolved-Bitrate": secondaryAudio.bitrate || "160kbps",
-      "X-Audio-Quality": secondaryAudio.bitrate || "160kbps"
-    });
+      }
+    } catch {}
   }
 
   return jsonResponse({
     error: "StreamUnavailable",
-    message: "Official high-resolution stream could not be resolved from primary or secondary audio providers."
+    message: "Official high-resolution stream could not be resolved for this track."
   }, 404);
 }
 
@@ -7554,24 +5978,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
     return jsonResponse({ data: [] }, 200);
   }
 
-  // Any external video/audio stream (GoogleVideo, Invidious `/videoplayback` or `/latest_version`, Piped, Apple Video)
-  const isExternalVideoOrTunnel =
-    host.includes("googlevideo.com") ||
-    host.includes("piped") ||
-    host.includes("invidious") ||
-    host.includes("nadeko.net") ||
-    host.includes("nerdvpn.de") ||
-    host.includes("yewtu.be") ||
-    host.includes("tux.pizza") ||
-    host.includes("melmac.space") ||
-    host.includes("video-ssl.itunes.apple.com") ||
-    parsedTarget.pathname.includes("/videoplayback") ||
-    parsedTarget.pathname.includes("/latest_version");
-
-  if (isExternalVideoOrTunnel) {
-    return await pipeMediaStreamWithFallback(request, [parsedTarget.toString()]);
-  }
-
+  // Intercept JioSaavn API calls proxied via /stream?url=...
   if (host.includes("jiosaavn.com") && parsedTarget.pathname.includes("api.php")) {
     const callType = parsedTarget.searchParams.get("__call") || "";
 
@@ -7593,7 +6000,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
         return jsonResponse(homeData, 200, {
           "X-Home-Source": "SpotifyAndAppleMusicIntercepted"
         });
-      }, "v13-projectvelo-stream-home");
+      }, "v10-projectvelo-stream-home");
     }
 
     if (callType === "content.getAlbumDetails" || callType === "playlist.getDetails") {
@@ -7601,7 +6008,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
       return await withEdgeCache(request, ctx, 1800, async () => {
         const enrichedAlbum = await resolveCompleteAlbum(albumId, origin, preferredQuality);
         return jsonResponse(enrichedAlbum);
-      }, "v13-projectvelo-stream-album");
+      }, "v10-projectvelo-stream-album");
     }
 
     if (callType === "reco.getreco") {
@@ -7627,7 +6034,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
           });
         }
 
-        const res = await fetchWithTimeout(parsedTarget.toString(), { headers: SAAVN_HEADERS }, 4500);
+        const res = await fetchWithTimeout(parsedTarget.toString(), { headers: SAAVN_HEADERS }, 5500);
         const text = (await res.text()).trim();
         const start = text.indexOf("{");
         const clean = start > 0 ? text.slice(start, text.lastIndexOf("}") + 1) : text;
@@ -7646,7 +6053,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
           }
         }
         return jsonResponse(data);
-      }, "v13-projectvelo-stream-api");
+      }, "v10-projectvelo-stream-api");
     }
   }
 
@@ -7655,9 +6062,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
     || host.includes("sop.saavncdn.com")
     || host.includes("mzstatic.com")
     || host.includes("scdn.co")
-    || host.includes("spotifycdn.com")
-    || host.includes("ytimg.com")
-    || host.includes("googleusercontent.com");
+    || host.includes("spotifycdn.com");
 
   if (isImage && request.method === "GET" && !request.headers.has("Range")) {
     const cache = caches.default;
@@ -7682,7 +6087,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
           ? "https://music.apple.com/"
           : (host.includes("scdn.co") || host.includes("spotifycdn.com") ? "https://open.spotify.com/" : "https://www.jiosaavn.com/")
       }
-    }, 4500);
+    }, 5000);
 
     if (imgRes.ok && imgRes.body) {
       const imgHeaders = new Headers(CORS_HEADERS);
@@ -7691,15 +6096,33 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
       imgHeaders.set("X-Cache-Status", "MISS");
 
       const [streamForCache, streamForClient] = imgRes.body.tee();
-      if (ctx) {
-        ctx.waitUntil(cache.put(cacheKey, new Response(streamForCache, { status: 200, headers: imgHeaders })));
-      }
+      ctx.waitUntil(cache.put(cacheKey, new Response(streamForCache, { status: 200, headers: imgHeaders })));
       return new Response(streamForClient, { status: 200, headers: imgHeaders });
     }
   }
 
   const isSaavnCdn = host.includes("saavncdn.com");
+  const isFullFileFetch = request.method === "GET" && !request.headers.has("Range");
+  const cache = caches.default;
+
+  // If the client is doing a full-file fetch (e.g., for In-App Offline Vault `saveSongOfflineInApp` or RAM Blob pre-buffer),
+  // check Cloudflare Edge Cache first to serve the audio file with 0 upstream subrequests!
   const rawTargetStr = parsedTarget.toString();
+  const edgeAudioCacheKey = new Request(`https://edge-audio.projectvelo.workers.dev/audio?u=${encodeURIComponent(rawTargetStr)}&q=${preferredQuality}`, {
+    method: "GET"
+  });
+
+  if (isFullFileFetch) {
+    try {
+      const cachedAudio = await cache.match(edgeAudioCacheKey);
+      if (cachedAudio && cachedAudio.ok) {
+        const hitHeaders = new Headers(cachedAudio.headers);
+        for (const [k, v] of Object.entries(CORS_HEADERS)) hitHeaders.set(k, v);
+        hitHeaders.set("X-Cache-Status", "HIT");
+        return new Response(cachedAudio.body, { status: 200, headers: hitHeaders });
+      }
+    } catch {}
+  }
 
   const upstreamHeaders = new Headers({
     "User-Agent": SAAVN_HEADERS["User-Agent"],
@@ -7729,11 +6152,11 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
   for (const candidate of [...new Set(candidateUrls)]) {
     usedUrl = candidate;
     try {
-      const attemptRes = await fetch(candidate, {
+      const attemptRes = await fetchWithTimeout(candidate, {
         method: request.method === "HEAD" ? "HEAD" : "GET",
         headers: upstreamHeaders,
         redirect: "follow"
-      });
+      }, 6800);
 
       if (attemptRes.ok || attemptRes.status === 206) {
         const contentLen = parseInt(attemptRes.headers.get("content-length") || "99999", 10);
@@ -7758,7 +6181,16 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
   }
 
   const resHeaders = new Headers(CORS_HEADERS);
-  for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]) {
+  const forwardHeaders = [
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "etag",
+    "last-modified"
+  ];
+
+  for (const h of forwardHeaders) {
     if (upstreamRes.headers.has(h)) {
       resHeaders.set(h, upstreamRes.headers.get(h));
     }
@@ -7767,7 +6199,7 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
   if (isSaavnCdn || /\.(mp4|m4a|mp3)(\?.*)?$/i.test(usedUrl)) {
     if (/\.mp3(\?.*)?$/i.test(usedUrl)) {
       resHeaders.set("Content-Type", "audio/mpeg");
-    } else if (!resHeaders.has("Content-Type")) {
+    } else {
       resHeaders.set("Content-Type", "audio/mp4");
     }
   }
@@ -7782,13 +6214,25 @@ async function handleSmartStream(request, targetUrl, origin, ctx, returnNullOnFa
   resHeaders.set("X-Upstream-Status", String(upstreamRes.status));
   resHeaders.set("X-Upstream-Url", upstreamRes.url || usedUrl);
   resHeaders.set("X-Audio-Quality", `${preferredQuality}kbps`);
-  resHeaders.set("X-Audio-Source", isSaavnCdn ? "JioSaavn320kbps" : "SecondaryHighResStream");
 
   const bitrateMatch = usedUrl.match(/_(320|160|96)(_p)?\.(mp4|mp3)/i);
   if (bitrateMatch) {
     resHeaders.set("X-Resolved-Bitrate", `${bitrateMatch[1]}kbps`);
   } else {
     resHeaders.set("X-Resolved-Bitrate", `${preferredQuality}kbps`);
+  }
+
+  // Cache full 200 OK audio responses at the Cloudflare Edge so offline downloads & RAM pre-buffers are instant
+  if (isFullFileFetch && upstreamRes.status === 200 && upstreamRes.body && ctx) {
+    const [bodyForEdge, bodyForClient] = upstreamRes.body.tee();
+    ctx.waitUntil(
+      cache.put(edgeAudioCacheKey, new Response(bodyForEdge, { status: 200, headers: resHeaders })).catch(() => {})
+    );
+    return new Response(bodyForClient, {
+      status: 200,
+      statusText: upstreamRes.statusText,
+      headers: resHeaders
+    });
   }
 
   return new Response(upstreamRes.body, {
@@ -7806,7 +6250,7 @@ async function handleSearchRoute(request, url, ctx) {
     return await withEdgeCache(request, ctx, 600, async () => {
       const searchPayload = await executeIntelligentHybridSearch(q, url.origin, request, url, ctx);
       return jsonResponse(searchPayload);
-    }, "v13-projectvelo-search");
+    }, "v10-projectvelo-search");
   }
 
   const { readable, writable } = new TransformStream();
@@ -7819,10 +6263,10 @@ async function handleSearchRoute(request, url, ctx) {
       const { songs, albums } = await executeIntelligentHybridSearch(q, url.origin, request, url, ctx);
 
       for (const s of songs) {
-        await writeLine({ event: "TrackDetails", source_name: "ProjectVeloSpotifyAppleYouTubeSaavnBridge", data: s });
+        await writeLine({ event: "TrackDetails", source_name: "ProjectVeloSpotifyAppleSaavnBridge", data: s });
       }
       for (const a of albums) {
-        await writeLine({ event: "AlbumDetails", source_name: "ProjectVeloSpotifyAppleYouTubeSaavnBridge", data: a });
+        await writeLine({ event: "AlbumDetails", source_name: "ProjectVeloSpotifyAppleSaavnBridge", data: a });
       }
       await writeLine({ event: "done", timestamp: Date.now() });
     } catch (e) {
@@ -7853,7 +6297,7 @@ function jsonResponse(obj, status = 200, extraHeaders = {}) {
   });
 }
 
-async function withEdgeCache(request, ctx, ttlSeconds, computeFn, cacheNamespace = "v13-projectvelo") {
+async function withEdgeCache(request, ctx, ttlSeconds, computeFn, cacheNamespace = "v10-projectvelo") {
   if (request.method !== "GET") return await computeFn();
 
   const cache = caches.default;
@@ -7878,14 +6322,10 @@ async function withEdgeCache(request, ctx, ttlSeconds, computeFn, cacheNamespace
     cacheHeaders.set("Cache-Control", `public, s-maxage=${ttlSeconds}, stale-while-revalidate=86400`);
     cacheHeaders.set("X-Cache-Status", "MISS");
     const cloned = new Response(freshRes.clone().body, { status: 200, headers: cacheHeaders });
-    if (ctx) {
-      ctx.waitUntil(cache.put(cacheKey, cloned));
-    }
+    ctx.waitUntil(cache.put(cacheKey, cloned));
     return new Response(freshRes.body, { status: 200, headers: cacheHeaders });
   }
 
   return freshRes;
 }
-
-// --- END OF FILE worker.js (ProjectVelo v13.0.0) ---
 
